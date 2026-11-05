@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+矢印パズル（棒を矢印の向きに抜いて全部逃がすゲーム）自動解答bot
+
+  screencap → グリッド上の棒を抽出 → 矢印の頭を判定 → 貪欲法で解く → input tap
+
+ルール: 棒は矢印の頭の向きへ抜ける。その直線上に他の棒があると抜けない。
+        抜けた棒は空きを増やすだけで他を塞がないので、
+        「今抜ける棒を抜く」を繰り返すだけで解ける盤面は必ず解ける（探索不要）。
+
+使い方:
+  python arrow_bot.py --analyze shot.jpg    # 画像1枚を解いて arrow_solution.png を出す（ADB不要）
+  python arrow_bot.py --dry-run             # 実機を読んで解答画像を保存するだけ。タップしない
+  python arrow_bot.py --step                # 1本タップするたびに読み直す（慎重モード）
+  python arrow_bot.py                       # 本番（盤面が消えたら次の面を待つ。Ctrl+Cで停止）
+
+adb接続・画面取得は kate_merge_bot.py のものを使う（同じフォルダに置くこと）。
+"""
+import argparse
+import os
+import sys
+import time
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kate_merge_bot as kb  # noqa: E402  adb / screencap / auto_connect / is_termux を流用
+
+# ===== 1080x2340 基準の値（解像度が違えば高さ比で換算） =====
+REF_H = 2340
+SEARCH_Y = (345, 2000)   # 盤面を探す縦範囲（上のヘッダ線より下、下のボタンより上）
+DARK = 120               # これより暗い画素を「線」とみなす
+REF_PITCH = 43.7         # 判定オフセットの基準にしたマス幅
+TAP_WAIT = 0.35          # 同じ波の中でのタップ間隔
+WAVE_WAIT = 0.8          # 波と波の間（前の棒が抜けきるのを待つ）
+
+
+# ---------------- 盤面解析 ----------------
+def _runs(on):
+    out, s = [], None
+    for i, v in enumerate(on):
+        if v and s is None:
+            s = i
+        if not v and s is not None:
+            out.append((s, i - 1))
+            s = None
+    if s is not None:
+        out.append((s, len(on) - 1))
+    return out
+
+
+def _fit_axis(B, axis, lo, hi, line_w):
+    """線の中心が並ぶ等間隔グリッドを当てはめる。戻り値 (原点, ピッチ, 個数) """
+    prof = B.sum(axis)
+    thr = max(5, 0.25 * np.percentile(prof[prof > 0], 90)) if (prof > 0).any() else 5
+    cs = [(a + b) / 2 for a, b in _runs(prof > thr) if line_w * 0.5 <= b - a + 1 <= line_w * 1.8]
+    if len(cs) < 3:
+        return None
+    cs = np.array(cs)
+    # ピッチ：線の中心が最もよく揃う周期を探す（線幅の2〜6倍の範囲。半分・倍の周期は範囲外）
+    ps = np.arange(line_w * 2, line_w * 6, 0.05)
+    score = [abs(np.exp(2j * np.pi * cs / p).sum()) for p in ps]
+    p = ps[int(np.argmax(score))]
+    phase = np.angle(np.exp(2j * np.pi * cs / p).sum()) / (2 * np.pi) * p
+    k = np.round((cs - phase) / p)
+    # 線の中心をグリッド番号に対して最小二乗フィット（ズレていた点は除外）
+    ok = np.abs(cs - phase - k * p) < line_w * 0.6
+    A = np.vstack([np.ones(ok.sum()), k[ok]]).T
+    (c0, p), *_ = np.linalg.lstsq(A, cs[ok], rcond=None)
+    # 外周は先端の突き出し（<半マス）を考慮して点の範囲から決める
+    idx = np.nonzero(prof > 0)[0]
+    first = int(np.ceil((idx[0] - c0) / p - 0.05))
+    last = int(np.floor((idx[-1] - c0) / p + 0.05))
+    return lo + c0 + first * p, p, last - first + 1
+
+
+def parse_board(img, grid=None):
+    """盤面を読む。戻り値 (dict(bars, nx, ny, P, grid…), None) か、読めなければ (None, 理由)
+    grid を渡すとグリッド推定を省いてそれを使う（棒が減ると推定が不安定になるため、面の最初に読んだものを固定）"""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    H, W = g.shape
+    s = H / REF_H
+    y_lo, y_hi = int(SEARCH_Y[0] * s), int(SEARCH_Y[1] * s)
+    B = np.zeros_like(g, bool)
+    B[y_lo:y_hi] = g[y_lo:y_hi] < DARK
+    if B.sum() < 300 * s * s:
+        return None, "盤面なし"
+    if grid is None:
+        if B.sum() < 2000 * s * s:
+            return None, "盤面なし"
+        ys, xs = np.nonzero(B)
+        sub = B[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        # 線幅の目安：短い黒ランの中央値
+        rl = [b - a + 1 for row in sub[::7] for a, b in _runs(row)]
+        line_w = float(np.median(rl)) if rl else 12
+        fx = _fit_axis(sub, 0, xs.min(), xs.max(), line_w)
+        fy = _fit_axis(sub, 1, ys.min(), ys.max(), line_w)
+        if not fx or not fy:
+            return None, "グリッド検出失敗"
+        grid = fx + fy
+    (x0, px, nx, y0, py, ny) = grid
+    if abs(px - py) > 0.1 * px or nx < 2 or ny < 2:
+        return None, f"グリッドが不自然 px={px:.1f} py={py:.1f}"
+    P = lambda c, r: (x0 + c * px, y0 + r * py)  # noqa: E731
+    k = px / REF_PITCH
+
+    def dark(x, y, r=3):
+        x, y = int(round(x)), int(round(y))
+        if not (r <= x < W - r and r <= y < H - r):
+            return False
+        return B[y - r:y + r + 1, x - r:x + r + 1].mean() > 0.5
+
+    nodes = {(c, r) for c in range(nx) for r in range(ny) if dark(*P(c, r))}
+    adj = {u: set() for u in nodes}
+    for (c, r) in nodes:
+        for dc, dr in ((1, 0), (0, 1)):
+            v = (c + dc, r + dr)
+            if v in nodes:
+                (xa, ya), (xb, yb) = P(c, r), P(*v)
+                if dark((xa + xb) / 2, (ya + yb) / 2):
+                    adj[(c, r)].add(v)
+                    adj[v].add((c, r))
+
+    def head_score(e, d):
+        # 矢印の頭：端点から先に突き出た先端＋左右の羽
+        x, y = P(*e)
+        dc, dr = d
+        sc = int(dark(x + dc * 15 * k, y + dr * 15 * k, 2))
+        for sg in (1, -1):
+            sc += int(dark(x - dc * 2 * k + sg * dr * 14 * k, y - dr * 2 * k + sg * dc * 14 * k, 2))
+        return sc
+
+    seen, bars, problems = set(), [], []
+    for u0 in nodes:
+        if u0 in seen:
+            continue
+        comp, st = [], [u0]
+        while st:
+            u = st.pop()
+            if u in seen:
+                continue
+            seen.add(u)
+            comp.append(u)
+            st += adj[u]
+        ends = [u for u in comp if len(adj[u]) == 1]
+        if len(comp) == 1 or len(ends) != 2 or any(len(adj[u]) > 2 for u in comp):
+            problems.append((comp, "分岐/交差"))
+            continue
+        sc = []
+        for e in ends:
+            nb = next(iter(adj[e]))
+            d = (e[0] - nb[0], e[1] - nb[1])
+            sc.append((head_score(e, d), e, d))
+        sc.sort(reverse=True)
+        if sc[0][0] < 2 or sc[1][0] >= 2:
+            problems.append((comp, f"頭が曖昧 {sc[0][0]}/{sc[1][0]}"))
+            continue
+        _, head, d = sc[0]
+        tail = sc[1][1]
+        path, prev = [tail], None
+        while path[-1] != head:
+            u = path[-1]
+            nxt = [v for v in adj[u] if v != prev][0]
+            prev, _ = u, path.append(nxt)
+        bars.append(dict(path=path, head=head, d=d))
+    return dict(bars=bars, problems=problems, nx=nx, ny=ny, P=P, pitch=px, grid=grid), None
+
+
+def solve(board):
+    """貪欲法。戻り値: 波のリスト（同じ波の棒は互いに独立）と、抜けない棒"""
+    bars, nx, ny = board["bars"], board["nx"], board["ny"]
+    occ = {u: i for i, b in enumerate(bars) for u in b["path"]}
+    alive = set(range(len(bars)))
+
+    def free(i):
+        (c, r), (dc, dr) = bars[i]["head"], bars[i]["d"]
+        c, r = c + dc, r + dr
+        while 0 <= c < nx and 0 <= r < ny:
+            j = occ.get((c, r))
+            if j is not None and j in alive and j != i:   # 自分の体は無視（要実機確認）
+                return False
+            c, r = c + dc, r + dr
+        return True
+
+    waves = []
+    while alive:
+        w = [i for i in sorted(alive) if free(i)]
+        if not w:
+            break
+        waves.append(w)
+        alive -= set(w)
+    return waves, sorted(alive)
+
+
+def tap_point(board, i):
+    p = board["bars"][i]["path"]
+    return tuple(int(v) for v in board["P"](*p[len(p) // 2]))
+
+
+def annotate(img, board, waves, stuck):
+    out = img.copy()
+    P = board["P"]
+    n = 0
+    for w in waves:
+        for i in w:
+            n += 1
+            x, y = tap_point(board, i)
+            cv2.circle(out, (x, y), 17, (40, 120, 240), -1)
+            cv2.putText(out, str(n), (x - (14 if n >= 10 else 8), y + 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    for b in board["bars"]:
+        cv2.circle(out, tuple(int(v) for v in P(*b["head"])), 9, (60, 200, 60), 3)
+    for i in stuck:
+        for u in board["bars"][i]["path"]:
+            cv2.circle(out, tuple(int(v) for v in P(*u)), 6, (0, 0, 255), -1)
+    for comp, _ in board["problems"]:
+        for u in comp:
+            cv2.circle(out, tuple(int(v) for v in P(*u)), 6, (255, 0, 255), -1)
+    return out
+
+
+def analyze(img, grid=None):
+    board, err = parse_board(img, grid)
+    if err:
+        return None, None, None, err
+    waves, stuck = solve(board)
+    return board, waves, stuck, None
+
+
+def report(board, waves, stuck):
+    n = sum(map(len, waves))
+    print(f"グリッド {board['nx']}x{board['ny']}  マス幅 {board['pitch']:.1f}px  棒 {len(board['bars'])}本")
+    print(f"解答 {n}手 / {len(waves)}波  抜けない棒 {len(stuck)}  読み取り不良 {len(board['problems'])}")
+    for comp, why in board["problems"]:
+        print("  不良:", why, sorted(comp)[:3], "…")
+
+
+# ---------------- 実機ループ ----------------
+def save(path, img):
+    if path:
+        path = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        cv2.imwrite(path, img)
+
+
+def run(args):
+    if not kb.online_devices() and not kb.auto_connect():
+        print("adbにつながらない（ワイヤレスデバッグONを確認）")
+        return
+    kb.SERIAL = kb.SERIAL or kb.online_devices()[0]
+    if args.start_delay:
+        print(f"{args.start_delay}秒後に開始。今のうちにゲーム画面へ")
+        time.sleep(args.start_delay)
+    stop_file = os.path.expanduser(args.stop_file)
+    if os.path.exists(stop_file):
+        os.remove(stop_file)
+    print(f"開始。止めるには Ctrl+C か `touch {args.stop_file}`")
+    levels = taps = 0
+    waiting = bad = 0
+    had_board = False
+    grid = None          # 面の最初に読んだグリッドを、その面の間は使い回す
+    while True:
+        if os.path.exists(stop_file):
+            print("停止ファイルを検出")
+            break
+        img = kb.screencap()
+        board, waves, stuck, err = analyze(img, grid)
+        if err or not board["bars"]:
+            grid = None
+            if had_board:
+                levels += 1
+                had_board = False
+                print(f"== 盤面が消えた → クリアとみなす（{levels}面目） ==")
+                if args.levels and levels >= args.levels:
+                    break
+            waiting += 1
+            if waiting == 1:
+                print(f"盤面待ち（{err or '棒なし'}）。次の面を開いて")
+            if waiting * args.poll > args.idle_stop:
+                print(f"{args.idle_stop}秒盤面が出ないので停止")
+                break
+            time.sleep(args.poll)
+            continue
+        waiting = 0
+        save(args.save, annotate(img, board, waves, stuck))
+        if board["problems"]:
+            # 読み違いのまま押すとミス扱いになりうるので、怪しい時は押さない
+            bad += 1
+            report(board, waves, stuck)
+            print(f"読み取り不良あり → タップしない（{bad}回目）。画像: {args.save}")
+            if bad >= args.max_bad:
+                print(f"{args.max_bad}回続けて読めないので停止")
+                break
+            grid = None      # グリッドから読み直してみる
+            time.sleep(2)
+            continue
+        bad = 0
+        grid = board["grid"]
+        if not waves:
+            report(board, waves, stuck)
+            print("抜ける棒がない（読み違いか、ルール解釈違い）→ 停止")
+            break
+        had_board = True
+        plan = waves[:1] if args.step else waves
+        if args.step:
+            plan = [plan[0][:1]]
+        if args.dry_run:
+            report(board, waves, stuck)
+            print(f"dry-run: 解答画像を保存 → {args.save}")
+            break
+        print(f"棒{len(board['bars'])}本 → {sum(map(len, plan))}手実行")
+        for wi, w in enumerate(plan):
+            for i in w:
+                kb.tap(tap_point(board, i))
+                taps += 1
+                time.sleep(args.tap_wait)
+            if wi < len(plan) - 1:
+                time.sleep(args.wave_wait)
+        time.sleep(args.wave_wait)   # 抜けきってから読み直す（残っていれば続きを解く）
+    print(f"合計 {taps}タップ / {levels}面")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--analyze", metavar="IMAGE", help="画像を解いて arrow_solution.png を出力")
+    ap.add_argument("--dry-run", action="store_true", help="実機を読んで解答画像を保存するだけ")
+    ap.add_argument("--step", action="store_true", help="1タップごとに読み直す（慎重モード）")
+    ap.add_argument("--levels", type=int, default=0, help="この面数クリアしたら停止（0=無制限）")
+    ap.add_argument("--tap-wait", type=float, default=TAP_WAIT, help="同じ波の中のタップ間隔（秒）")
+    ap.add_argument("--wave-wait", type=float, default=WAVE_WAIT, help="波と波の間の待ち（秒）")
+    ap.add_argument("--max-bad", type=int, default=5, help="読み取り不良がこの回数続いたら停止")
+    ap.add_argument("--poll", type=float, default=1.0, help="盤面待ちの確認間隔（秒）")
+    ap.add_argument("--idle-stop", type=float, default=120, help="盤面がこの秒数出なければ停止")
+    ap.add_argument("--start-delay", type=float, default=5, help="開始前の待ち（ゲームへ切替える時間）")
+    ap.add_argument("--serial", help="adbの接続先（例 127.0.0.1:37123）")
+    ap.add_argument("--stop-file", default="~/arrow_stop", help="このファイルを作ると停止")
+    ap.add_argument("--save", default="~/storage/shared/Pictures/arrow_bot_latest.png"
+                    if kb.is_termux() else "arrow_bot_latest.png", help="毎回の解答画像の保存先")
+    args = ap.parse_args()
+    kb.SERIAL = args.serial
+    if args.analyze:
+        img = cv2.imread(args.analyze)
+        if img is None:
+            sys.exit(f"画像を開けない: {args.analyze}")
+        board, waves, stuck, err = analyze(img)
+        if err:
+            sys.exit(err)
+        report(board, waves, stuck)
+        cv2.imwrite("arrow_solution.png", annotate(img, board, waves, stuck))
+        print("→ arrow_solution.png")
+        return
+    try:
+        run(args)
+    except KeyboardInterrupt:
+        print("\n停止")
+    except kb.AdbError as e:
+        print(f"adbが切れた: {e}（python kate_merge_bot.py --connect で再接続して再実行）")
+
+
+if __name__ == "__main__":
+    main()
