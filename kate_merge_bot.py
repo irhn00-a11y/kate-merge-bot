@@ -36,8 +36,10 @@ ORDER_THRESHOLD = 0.60    # 注文アイコンとのテンプレ一致度がこ�
 ORDER_MARGIN = 0.12       # …その注文の最高一致から この差以内なら保護（マージしない）
 ORDER_BAND = (380, 720)   # 注文パネルを探す縦範囲（1080x2340基準）
 ORDER_MIN_X = 230         # これより左はスパナボタン等なので除外
-SWIPE_MS = 250            # ドラッグ時間
-WAIT_AFTER_MERGE = 0.6    # 合体アニメ待ち
+SWIPE_MS = 150            # ドラッグ時間
+WAIT_AFTER_MERGE = 0.35   # 1手ごとの待ち
+BATCH = 8                 # 1回の盤面読み取りで実行する最大手数（重ならないペアをまとめて実行）
+PRODUCE_WAIT = 1.0        # 生産タップ後、アイテムが飛び出すのを待つ秒数
 
 EMPTY, BOX, JAR, ITEM = "empty", "box", "jar", "item"
 
@@ -52,7 +54,24 @@ def adb(*args, binary=False):
     return out.stdout if binary else out.stdout.decode(errors="ignore")
 
 
+_RAW_OK = True
+
+
 def screencap():
+    """非圧縮のraw形式で取得（PNG圧縮を省くので速い）。失敗したらPNGに切替"""
+    global _RAW_OK
+    if _RAW_OK:
+        try:
+            raw = adb("exec-out", "screencap", binary=True)
+            w, h = np.frombuffer(raw[:8], "<u4")
+            hdr = len(raw) - int(w) * int(h) * 4
+            if hdr in (12, 16):
+                px = np.frombuffer(raw, np.uint8, offset=hdr).reshape(int(h), int(w), 4)
+                return cv2.cvtColor(px, cv2.COLOR_RGBA2BGR)
+        except Exception:
+            pass
+        _RAW_OK = False
+        print("raw取得に失敗 → PNG取得に切替")
     raw = adb("exec-out", "screencap", "-p", binary=True)
     img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
@@ -130,6 +149,10 @@ def feature(cell):
     return hist.flatten(), shape.flatten()
 
 
+_TMPL_CACHE = {}    # 注文アイコン → テンプレ
+_SCORE_CACHE = {}   # (注文, マス画像) → 一致度。盤面の大半は毎手変わらないので再利用
+
+
 def is_cream(hsv):
     """注文パネルのクリーム色（H≈28）。白っぽいアイテム（小麦粉など）はHが違うので残る"""
     return (hsv[..., 0] >= 18) & (hsv[..., 0] <= 38) & (hsv[..., 1] < 60) & (hsv[..., 2] > 215)
@@ -161,15 +184,21 @@ def read_orders(img):
                 continue
             m = (lab[oy:oy + oh, ox:ox + ow] == k).astype(np.uint8) * 255
             icon = roi[oy:oy + oh, ox:ox + ow]
-            orders.append(((x + ox, y + oy, ow, oh), order_templates(icon, m)))
+            key = hash(cv2.resize(icon, (16, 16)).tobytes())
+            if key not in _TMPL_CACHE:
+                _TMPL_CACHE[key] = order_templates(icon, m)
+            orders.append(((x + ox, y + oy, ow, oh), _TMPL_CACHE[key], key))
     return orders
 
 
-def order_templates(icon, mask, scales=np.linspace(1.0, 1.9, 10)):
+MATCH_SCALE = 0.5   # 注文照合は半分の解像度で行う（速度4倍）
+
+
+def order_templates(icon, mask, scales=np.linspace(1.0, 1.9, 7)):
     """注文アイコンを盤面サイズ相当まで拡大した (テンプレ, マスク) の一覧"""
     out = []
-    for s in scales:
-        t = cv2.resize(icon, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+    for s in scales * MATCH_SCALE:
+        t = cv2.resize(icon, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
         m = cv2.resize(mask, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
         out.append((t, m))
     return out
@@ -207,8 +236,17 @@ def analyze(img, protect_orders=True, producers=()):
         if kind == ITEM and not gen:
             cellimgs[(c, r)] = cell
     # 注文ごとに盤面アイテムを採点 → 最高一致の近くにいる物だけ保護
-    for _, tmpl in orders:
-        scores = {p: order_score(cl, tmpl) for p, cl in cellimgs.items()}
+    small = {p: cv2.resize(cl, None, fx=MATCH_SCALE, fy=MATCH_SCALE, interpolation=cv2.INTER_AREA)
+             for p, cl in cellimgs.items()}
+    if len(_SCORE_CACHE) > 5000:
+        _SCORE_CACHE.clear()
+    for _, tmpl, okey in orders:
+        scores = {}
+        for p, cl in small.items():
+            ck = (okey, hash(cl.tobytes()))
+            if ck not in _SCORE_CACHE:
+                _SCORE_CACHE[ck] = order_score(cl, tmpl)
+            scores[p] = _SCORE_CACHE[ck]
         if not scores:
             break
         top = max(scores.values())
@@ -256,7 +294,7 @@ def annotate(img, grid, groups, moves):
     pal = [tuple(int(x) for x in rng.integers(60, 255, 3)) for _ in range(64)]
     x0, y0, x1, y1 = board_rect(img)
     cw, ch = (x1 - x0) / COLS, (y1 - y0) / ROWS
-    for (ox, oy, ow, oh), _ in grid.get("_orders", []):
+    for (ox, oy, ow, oh), *_ in grid.get("_orders", []):
         cv2.rectangle(out, (ox - 4, oy - 4), (ox + ow + 4, oy + oh + 4), (0, 200, 255), 5)
     for key, v in grid.items():
         if key == "_orders":
@@ -333,6 +371,7 @@ def run(args):
     while True:
         if os.path.exists(stop_file):
             print("停止ファイル検出。停止"); break
+        t_cap = time.time()
         img = screencap()
         if not board_visible(img):
             hidden += 1
@@ -341,8 +380,11 @@ def run(args):
                 print("盤面が戻らないので停止"); break
             time.sleep(2); continue
         hidden = 0
+        t_an = time.time()
         grid, groups = analyze(img, protect_orders=not args.ignore_orders, producers=producers)
         moves = plan_merges(groups)
+        if args.verbose:
+            print(f"[時間] 取得 {t_an - t_cap:.2f}s / 解析 {time.time() - t_an:.2f}s / ペア {len(moves)}")
         prot = [k for k, v in grid.items() if k != "_orders" and v["protected"] and not v["producer"]]
         if prot and prot != last_prot:
             print(f"注文の品を保護中: {prot}")
@@ -370,15 +412,23 @@ def run(args):
                 print(f"合体なし → 生産機 {p} をタップ")
                 if args.dry_run:
                     time.sleep(1.5); continue
-                tap(grid[p]["center"])
-                time.sleep(0.9)
-                g2, _ = analyze(screencap(), protect_orders=False, producers=producers)
-                if count_kind(g2, EMPTY) >= before:
-                    cooldown[p] = time.time() + args.cooldown
-                    print(f"  {p} は何も出なかった → {args.cooldown}秒休ませる")
-                else:
+                # 1回目のタップは「選択」だけのことがあるので、出なければもう1回押す
+                out = False
+                for attempt in (1, 2):
+                    tap(grid[p]["center"])
+                    time.sleep(PRODUCE_WAIT)
+                    g2, _ = analyze(screencap(), protect_orders=False, producers=producers)
+                    if count_kind(g2, EMPTY) < before:
+                        out = True
+                        break
+                    print(f"  {attempt}回目のタップでは出なかった")
+                if out:
                     produced += 1
                     idle = 0
+                    print(f"  生産OK（累計 {produced}）")
+                else:
+                    cooldown[p] = time.time() + args.cooldown
+                    print(f"  {p} は2回押しても出なかった → {args.cooldown}秒休ませる")
                 if args.max_produce and produced >= args.max_produce:
                     print(f"{args.max_produce}回生産したので停止"); break
                 continue
@@ -386,12 +436,18 @@ def run(args):
         idle = 0
         if args.max_merges and merges >= args.max_merges:
             print(f"{args.max_merges}回マージしたので停止"); break
-        a, b = moves[0]   # 1手ずつ実行して毎回盤面を読み直す（ズレ防止）
-        merges += 1
-        print(f"#{merges} merge {a} -> {b}")
-        if not args.dry_run:
-            swipe(grid[a]["center"], grid[b]["center"])
-        time.sleep(WAIT_AFTER_MERGE if not args.dry_run else 1.5)
+        # 重ならないペアは1回の読み取りでまとめて実行（マージは他のマスに影響しないため）
+        batch = moves[:args.batch]
+        if args.max_merges:
+            batch = batch[:max(0, args.max_merges - merges)]
+        for a, b in batch:
+            merges += 1
+            print(f"#{merges} merge {a} -> {b}")
+            if not args.dry_run:
+                swipe(grid[a]["center"], grid[b]["center"], args.swipe_ms)
+                time.sleep(args.wait)
+        if args.dry_run:
+            time.sleep(1.5)
     print(f"合計 {merges} 回マージ / {produced} 回生産")
 
 
@@ -412,6 +468,10 @@ def main():
                     help="毎手の認識結果画像の保存先")
     ap.add_argument("--stop-file", default="~/kate_stop")
     ap.add_argument("--max-hidden", type=int, default=15)
+    ap.add_argument("--batch", type=int, default=BATCH, help="1回の読み取りで実行する最大手数（1=毎手読み直し）")
+    ap.add_argument("--swipe-ms", type=int, default=SWIPE_MS, help="ドラッグ時間ms")
+    ap.add_argument("--wait", type=float, default=WAIT_AFTER_MERGE, help="1手ごとの待ち秒")
+    ap.add_argument("-v", "--verbose", action="store_true", help="取得・解析の所要時間を表示")
     ap.add_argument("--ignore-orders", action="store_true", help="注文の品も保護せずマージする")
     ap.add_argument("--max-merges", type=int, default=0, help="この回数マージしたら停止（0=無制限）")
     args = ap.parse_args()
