@@ -5,7 +5,8 @@
 - タップ   → 押された棒の頭の先に他の棒が残っていたら「ミス」として数える
   使い方: python tools/arrow_sim.py docs/arrow_board.jpg [arrow_botの引数…]
   AFTER=same でクリア後も盤面そっくりの画面が出続ける最悪ケース、AFTER=next で次の面
-  AD=1 でクリア後に広告（戻る3回目で閉じる）、STORE=1 で1回目の戻るでストアに飛ばされる
+  AD=1 でクリア後に広告（戻る3回目で閉じる）、AD=btn で戻るが効かずスキップボタンでだけ閉じる広告
+  STORE=1 で1回目の戻るでストアに飛ばされる、AWAY=1 でクリア後しばらくClaudeアプリが前面
 """
 import os
 import sys
@@ -39,7 +40,12 @@ def levels_cleared():
     return cleared + 1
 
 
+AD_IMG = cv2.imread(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "ad_admob_skip.png"))
+
+
 def fake_screencap():
+    if ad_state["on"] and os.environ.get("AD") == "btn":
+        return AD_IMG.copy()
     img = src.copy()
     if len(gone) == len(bars) and AD and ad_state["shown"] < levels_cleared():
         ad_state.update(on=True, backs=0, shown=ad_state["shown"] + 1)
@@ -68,6 +74,13 @@ def fake_screencap():
 
 def fake_tap(p):
     global misses, taps
+    if ad_state["on"]:
+        if os.environ.get("AD") == "btn" and abs(p[0] - 1007) < 40 and abs(p[1] - 153) < 40:
+            ad_state["on"] = False          # スキップボタンで閉じた
+        else:
+            print("  !! 広告の中身をタップ", p)
+            misses += 1
+        return
     taps += 1
     i = bar_at(*p)
     if i is None:
@@ -90,14 +103,18 @@ GAME = "com.example.arrows/com.unity3d.player.UnityPlayerActivity"
 ADC = "com.example.arrows/com.applovin.adview.AppLovinFullscreenActivity"
 AD = os.environ.get("AD", "")          # AD=1 でクリア後に広告。戻る2回まではカウントダウン中で無視
 STORE = os.environ.get("STORE", "")    # STORE=1 で広告の1回目の戻るがストアに飛ばされる
-ad_state = dict(on=False, backs=0, store=False, shown=0)
+ad_state = dict(on=False, backs=0, store=False, shown=0, away=0)
+AWAY = os.environ.get("AWAY", "")      # AWAY=1 でクリア後しばらく Claude アプリが前面（戻るを押したらミス）
 backs_total = 0
 
 
 def fake_adb(*a, **k):
-    global backs_total
+    global backs_total, misses
     cmd = a[-1]
     if "dumpsys" in cmd:
+        if AWAY and len(gone) == len(bars) and ad_state["away"] < 6:
+            ad_state["away"] += 1
+            return "topResumedActivity=ActivityRecord{1 u0 com.anthropic.claude/.MainActivity t7}"
         if ad_state["store"]:
             return "topResumedActivity=ActivityRecord{1 u0 com.android.vending/.AssetBrowserActivity t9}"
         comp = ADC if ad_state["on"] else GAME
@@ -105,8 +122,13 @@ def fake_adb(*a, **k):
         return f"  topResumedActivity=ActivityRecord{{1 u0 {pkg}/{cls} t5}}"
     if "KEYCODE_BACK" in cmd:
         backs_total += 1
+        if AWAY and len(gone) == len(bars) and ad_state["away"] < 6:
+            print("  !! 別アプリ使用中に戻るを押した")
+            misses += 1
         if ad_state["store"]:
             ad_state["store"] = False
+        elif ad_state["on"] and AD == "btn":
+            pass                            # 戻るを受け付けない広告
         elif ad_state["on"]:
             ad_state["backs"] += 1
             if STORE and ad_state["backs"] == 1:
@@ -115,7 +137,6 @@ def fake_adb(*a, **k):
                 ad_state["on"] = False
         else:
             print("  !! ゲーム画面で戻るを押した")
-            global misses
             misses += 1
         return ""
     if "input tap" in cmd and ad_state["on"]:

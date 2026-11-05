@@ -277,18 +277,62 @@ def top_activity():
     return None
 
 
-def ad_kind(comp, game):
-    """'game' / 'ad'(戻るで閉じる) / 'hands_off'(触らない) / 'unknown'(記録だけ)"""
+def ad_kind(comp, game, recent_ad=False):
+    """'game' / 'ad'(閉じにいく) / 'away'(ユーザーが別アプリを使用中：触らない) / 'unknown'(記録だけ)
+    recent_ad: 直前まで広告が出ていた（ストア・ブラウザはその時だけ広告の飛び先とみなす）"""
     if comp is None or comp == game:
         return "game"
     low = comp.lower()
     if any(h in low for h in HANDS_OFF):
-        return "hands_off"
-    if any(h in low for h in AD_HINTS) or low.startswith(OUTSIDE_OK):
+        return "away"
+    if any(h in low for h in AD_HINTS):
         return "ad"
+    if low.startswith(OUTSIDE_OK) and recent_ad:
+        return "ad"          # 広告から飛ばされたストア/ブラウザ → 戻るで帰る
     if game and comp.split("/")[0] != game.split("/")[0]:
-        return "ad"          # 別アプリに飛ばされた（広告のリンク先など）→ 戻るで帰る
+        return "away"        # 自分で別アプリ（Claude等）を開いた → 何もしない
     return "unknown"         # ゲーム内の別画面（クリア画面等かも）→ 記録だけして触らない
+
+
+def find_close_button(img, exclude=(), ref=None):
+    """広告の閉じる/スキップボタン候補：画面上部の左右の隅にある、中に記号がある丸ボタン。
+    戻り値 (x, y) か None。2026-11-05 のAdMob動画広告（右上の ▷| ）で検出を確認
+    exclude: 押さない位置（押しても閉じなかった所）
+    ref: ゲーム画面のスクショ。同じ位置に見た目までそっくりの丸がある＝通話の吹き出し等のオーバーレイなので押さない"""
+    H, W = img.shape[:2]
+    s = W / 1080
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    best = None
+    gr = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY) if ref is not None and ref.shape == img.shape else None
+    for x0, x1 in ((0, int(W * .25)), (int(W * .75), W)):
+        roi = cv2.GaussianBlur(g[0:int(H * .15), x0:x1], (5, 5), 0)
+        cs = cv2.HoughCircles(roi, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30 * s, param1=60, param2=22,
+                              minRadius=int(18 * s), maxRadius=int(60 * s))
+        if cs is None:
+            continue
+        for cx, cy, r in cs[0]:
+            m = np.zeros_like(roi, np.uint8)
+            cv2.circle(m, (int(cx), int(cy)), int(r * .85), 255, -1)
+            ring = np.zeros_like(roi, np.uint8)
+            cv2.circle(ring, (int(cx), int(cy)), int(r * 1.4), 255, -1)
+            ring[m > 0] = 0
+            inside, outside = roi[m > 0], roi[ring > 0]
+            if inside.size == 0 or outside.size == 0:
+                continue
+            icon = np.percentile(inside, 95) - np.percentile(inside, 50)   # 円の中に記号がある
+            edge = abs(float(np.median(inside)) - float(np.median(outside)))  # 円と外側の色が違う
+            sc = min(icon, 120) + min(edge, 60)
+            if any(abs(cx + x0 - ex) < 45 * s and abs(cy - ey) < 45 * s for ex, ey in exclude):
+                continue
+            if gr is not None:
+                X, Y, R = int(cx + x0), int(cy), max(4, int(r * 0.7))   # 丸の内側だけ比べる（外側は背景が違う）
+                a = g[max(0, Y - R):Y + R, max(0, X - R):X + R].astype(int)
+                b = gr[max(0, Y - R):Y + R, max(0, X - R):X + R].astype(int)
+                if a.size and (np.abs(a - b) < 12).mean() > 0.6:
+                    continue     # 6割以上の画素がゲーム画面と同じ＝オーバーレイ（丸が吹き出しからはみ出しても判定できる）
+            if icon > 40 and edge > 8 and (best is None or sc > best[0]):
+                best = (sc, int(cx + x0), int(cy))
+    return best[1:] if best else None
 
 
 def back():
@@ -353,25 +397,50 @@ def run(args):
     game = None          # ゲーム画面の Activity（最初に盤面を解き始めた時に記録）
     ad = None            # 表示中の広告 dict(comp, t0, backs, last_back, sampled)
     finish_at = None     # 指定面数をクリアした時刻。広告が出たら閉じてから止める
+    last_ad = 0          # 最後に広告を見た時刻（ストア等を広告の飛び先とみなす判定用）
+    game_ref = None      # ゲーム画面のスクショ（通話の吹き出し等のオーバーレイを広告ボタンと区別する）
     while True:
         if os.path.exists(stop_file):
             print("停止ファイルを検出")
             break
         if state == "seek" and game and not args.no_ad:
             comp = top_activity()
-            kind = ad_kind(comp, game)
+            kind = ad_kind(comp, game, recent_ad=time.time() - last_ad < 30)
             if kind != "game":
                 now = time.time()
                 if ad is None or ad["comp"] != comp:
-                    ad = dict(comp=comp, t0=now, backs=0, last_back=0, sampled=False, kind=kind)
+                    ad = dict(comp=comp, t0=now, backs=0, taps=0, last_act=0, sampled=False, kind=kind, n=0,
+                              tried={}, dead=[])
                     print(f"広告/別画面: {comp}（{kind}）")
+                if kind == "away":
+                    # 自分で別アプリを使っている間は何もしない（戻すと邪魔になる）
+                    if now - ad["t0"] > args.away_stop:
+                        print(f"{args.away_stop:.0f}秒ゲームに戻らないので停止")
+                        break
+                    time.sleep(1.0)
+                    continue
                 if not ad["sampled"] and now - ad["t0"] > 1.0:
                     ad_sample(args, kind, comp)
                     ad["sampled"] = True
-                if kind == "ad" and now - ad["last_back"] >= args.ad_back:
-                    back()
-                    ad["backs"] += 1
-                    ad["last_back"] = now
+                if kind == "ad":
+                    last_ad = now
+                    if now - ad["last_act"] >= args.ad_back:
+                        # 閉じる/スキップの丸ボタンがあれば押す。なければ戻る。
+                        # 同じ所を押しても閉じない時のため、ボタンと戻るを交互に試す
+                        btn = find_close_button(kb.screencap(), ad["dead"], game_ref) if ad["n"] % 2 == 0 else None
+                        if btn:
+                            kb.tap(btn)
+                            ad["taps"] += 1
+                            hit = ad["tried"].setdefault(btn, 0) + 1
+                            ad["tried"][btn] = hit
+                            print(f"  閉じるボタンらしき所をタップ {btn}")
+                            if hit >= 2:
+                                ad["dead"].append(btn)   # 2回押しても閉じない所は以後押さない
+                        else:
+                            back()
+                            ad["backs"] += 1
+                        ad["n"] += 1
+                        ad["last_act"] = now
                 if now - ad["t0"] > args.ad_timeout:
                     ad_sample(args, "timeout", comp)
                     print(f"{args.ad_timeout:.0f}秒閉じられないので停止（スクショを {args.ad_dir} に保存）")
@@ -380,9 +449,12 @@ def run(args):
                 time.sleep(0.5)
                 continue
             if ad:
-                print(f"広告を閉じた（{time.time() - ad['t0']:.1f}秒 / 戻る{ad['backs']}回）")
+                if ad["kind"] == "away":
+                    print("ゲームに戻ってきた")
+                else:
+                    print(f"広告を閉じた（{time.time() - ad['t0']:.1f}秒 / ボタン{ad['taps']}回 / 戻る{ad['backs']}回）")
                 with open(os.path.expanduser(args.ad_log), "a", encoding="utf-8") as f:
-                    f.write(f"{time.strftime('%F %T')},closed,{ad['comp']},{time.time() - ad['t0']:.1f}s,back{ad['backs']}\n")
+                    f.write(f"{time.strftime('%F %T')},closed_{ad['kind']},{ad['comp']},{time.time() - ad['t0']:.1f}s,btn{ad['taps']},back{ad['backs']}\n")
                 ad = None
                 if finish_at:
                     break
@@ -464,6 +536,8 @@ def run(args):
             if game is None and not args.no_ad:
                 game = top_activity()
                 print(f"ゲーム画面: {game}")
+            if not args.no_ad:
+                game_ref = img      # 広告中に「ゲーム画面にもある丸」を除外するための見本
             report(board, waves, stuck)
 
         save(args.save, annotate(img, board, waves, stuck))
@@ -495,7 +569,8 @@ def main():
     ap.add_argument("--tap-wait", type=float, default=TAP_WAIT, help="同じ波の中のタップ間隔（秒）")
     ap.add_argument("--wave-wait", type=float, default=WAVE_WAIT, help="波と波の間の待ち（秒）")
     ap.add_argument("--no-ad", action="store_true", help="広告処理をしない")
-    ap.add_argument("--ad-back", type=float, default=2.0, help="広告中に戻るを押す間隔（秒）")
+    ap.add_argument("--ad-back", type=float, default=2.0, help="広告中に閉じる操作をする間隔（秒）")
+    ap.add_argument("--away-stop", type=float, default=600, help="別アプリを開いたままこの秒数たったら停止")
     ap.add_argument("--ad-timeout", type=float, default=90, help="広告がこの秒数閉じなければ停止")
     ap.add_argument("--ad-grace", type=float, default=5, help="最終面クリア後、広告が出るのを待つ秒数")
     ap.add_argument("--ad-dir", default="~/storage/shared/Pictures/arrow_ads" if kb.is_termux() else "arrow_ads", help="広告スクショの保存先")
