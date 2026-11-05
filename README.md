@@ -166,3 +166,13 @@ python arrow_bot.py                      # 本番。面が消えたら次の面�
 - 面ごとのクリア秒数をログに表示
 - 検証（tools/arrow_sim.py、`AFTER=same` はクリア後も盤面そっくりの画面が出続ける最悪ケース、`AFTER=next` は次の面が出るケース）：
   通常/`--levels 0`/`--step` × 盤面なし/そっくり画面 の6通りすべてで、クリア後の余計なタップ0。`AFTER=next --levels 3` で3面111タップ・ミス0
+
+## ホーム画面ショートカット（Termux:Widget）
+押すだけで「git pull → 倍速設定で1面解く」を裏で実行。ターミナルは開かない。
+1. **Termux:Widget** を入れる（Termux本体と同じ入手元：F-Droid か GitHub）
+2. Termuxで1回だけ：`cd ~/kate-merge-bot && git pull && bash install_shortcuts.sh`
+3. ホーム画面を長押し → ウィジェット → Termux:Widget を置く → `arrow-bot.sh` / `arrow-stop.sh` が並ぶ
+- `arrow-bot.sh`：押したら3秒以内にゲーム画面へ（盤面が出るまで最大2分待つ）。開始・終了を画面下に吹き出し表示（Termux:API）
+- `arrow-stop.sh`：途中で止める
+- ログ：`~/arrow_bot.log`（直近500行）。以後の更新はショートカットが毎回 `git pull` するので手動pull不要
+- 検証：仮のHOMEとダミーの python / termux-toast で「登録 → 起動 → ログ → 吹き出し → 停止ファイル」の流れを確認。実機のTermux:Widgetでは未検証
