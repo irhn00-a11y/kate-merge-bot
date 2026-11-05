@@ -65,6 +65,7 @@ def fake_tap(p):
 
 
 kb.screencap, kb.tap = fake_screencap, fake_tap
+ab.tap_many = lambda pts, gap: [fake_tap(p) for p in pts]
 kb.online_devices = lambda: ["sim"]
 kb.time.sleep = ab.time.sleep = lambda s: None
 sys.argv = ["arrow_bot.py", "--levels", "1", "--start-delay", "0", "--save", ""] + sys.argv[2:]

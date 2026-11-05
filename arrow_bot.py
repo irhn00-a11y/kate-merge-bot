@@ -32,8 +32,8 @@ REF_H = 2340
 SEARCH_Y = (345, 2000)   # 盤面を探す縦範囲（上のヘッダ線より下、下のボタンより上）
 DARK = 120               # これより暗い画素を「線」とみなす
 REF_PITCH = 43.7         # 判定オフセットの基準にしたマス幅
-TAP_WAIT = 0.35          # 同じ波の中でのタップ間隔
-WAVE_WAIT = 0.8          # 波と波の間（前の棒が抜けきるのを待つ）
+TAP_WAIT = 0.12          # 同じ波の中でのタップ間隔（v2で0.35→0.12）
+WAVE_WAIT = 0.4          # 波と波の間（前の棒が抜けきるのを待つ。v2で0.8→0.4）
 
 
 # ---------------- 盤面解析 ----------------
@@ -237,6 +237,14 @@ def report(board, waves, stuck):
 
 
 # ---------------- 実機ループ ----------------
+def tap_many(points, gap):
+    """1波ぶんのタップを1回の adb shell にまとめる（1タップごとのadb往復を省く）"""
+    if len(points) == 1:
+        return kb.tap(points[0])
+    cmd = f"; sleep {gap:.2f}; ".join(f"input tap {x} {y}" for x, y in points)
+    kb.adb("shell", cmd, timeout=10 + len(points) * (gap + 1))
+
+
 def save(path, img):
     if path:
         path = os.path.expanduser(path)
@@ -311,10 +319,8 @@ def run(args):
             break
         print(f"棒{len(board['bars'])}本 → {sum(map(len, plan))}手実行")
         for wi, w in enumerate(plan):
-            for i in w:
-                kb.tap(tap_point(board, i))
-                taps += 1
-                time.sleep(args.tap_wait)
+            tap_many([tap_point(board, i) for i in w], args.tap_wait)
+            taps += len(w)
             if wi < len(plan) - 1:
                 time.sleep(args.wave_wait)
         time.sleep(args.wave_wait)   # 抜けきってから読み直す（残っていれば続きを解く）
