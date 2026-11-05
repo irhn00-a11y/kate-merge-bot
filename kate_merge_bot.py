@@ -351,21 +351,6 @@ def empty_cells(img, grid):
     return out
 
 
-def wait_for_drop(empties, timeout=PRODUCE_TIMEOUT):
-    """どれかの空きマスに物が置かれるまで見張る。着地アニメが遅くても取りこぼさない"""
-    if not empties:
-        return False
-    end = time.time() + timeout
-    while time.time() < end:
-        time.sleep(PRODUCE_POLL)
-        img = screencap()
-        for a, b, w, h, ref in empties.values():
-            cur = img[b:b + h, a:a + w].astype(np.int16)
-            if cur.shape == ref.shape and np.abs(cur - ref).mean() > CHANGE_DIFF:
-                return True
-    return False
-
-
 def count_kind(grid, kind):
     return sum(1 for k, v in grid.items() if k != "_orders" and v["kind"] == kind)
 
@@ -385,6 +370,31 @@ def parse_cells(tokens):
 
 
 # ---------------- メインループ ----------------
+def count_dropped(empties, img):
+    """前は空きだったマスのうち、物が置かれたマスの数"""
+    n = 0
+    for a, b, w, h, ref in empties.values():
+        cur = img[b:b + h, a:a + w].astype(np.int16)
+        if cur.shape == ref.shape and np.abs(cur - ref).mean() > CHANGE_DIFF:
+            n += 1
+    return n
+
+
+def settle_count(empties, timeout=PRODUCE_TIMEOUT):
+    """着地アニメが落ち着くまで見張り、最終的に埋まったマス数を返す"""
+    end = time.time() + timeout
+    time.sleep(0.5)
+    last, stable = -1, 0
+    while time.time() < end:
+        n = count_dropped(empties, screencap())
+        stable = stable + 1 if n == last else 0
+        if n > 0 and stable >= 1:
+            return n
+        last = n
+        time.sleep(PRODUCE_POLL)
+    return max(last, 0)
+
+
 def run(args):
     stop_file = os.path.expanduser(args.stop_file)
     if os.path.exists(stop_file):
@@ -393,11 +403,12 @@ def run(args):
         print(f"{args.start_delay}秒後に開始。今のうちにゲーム画面へ")
         time.sleep(args.start_delay)
     print(f"開始。止めるには Ctrl+C か `touch {args.stop_file}`")
-    idle = hidden = merges = produced = rr = 0
+    idle = hidden = merges = produced = 0
     last_prot = None
     producers = parse_cells(args.produce) if args.produce else []
-    cooldown = {}
-    fails = {}
+    cooldown, fails = {}, {}
+    cur = None            # いま使っている生産機（選択済みなら1タップ=1個なので使い続ける）
+    phase = "merge"       # merge: ペアが尽きるまでマージ / produce: 空きが埋まるまで生産
     if producers:
         print(f"生産機: {producers}（マージ・移動しない）")
     while True:
@@ -415,8 +426,9 @@ def run(args):
         t_an = time.time()
         grid, groups = analyze(img, protect_orders=not args.ignore_orders, producers=producers)
         moves = plan_merges(groups)
+        n_empty = count_kind(grid, EMPTY)
         if args.verbose:
-            print(f"[時間] 取得 {t_an - t_cap:.2f}s / 解析 {time.time() - t_an:.2f}s / ペア {len(moves)}")
+            print(f"[時間] 取得 {t_an - t_cap:.2f}s / 解析 {time.time() - t_an:.2f}s / ペア {len(moves)} / 空き {n_empty} / {phase}")
         prot = [k for k, v in grid.items() if k != "_orders" and v["protected"] and not v["producer"]]
         if prot and prot != last_prot:
             print(f"注文の品を保護中: {prot}")
@@ -426,49 +438,67 @@ def run(args):
             cv2.imwrite(os.path.expanduser(args.save), view)
         if not args.no_view:
             show("kate-bot", view)
-        if not moves:
-            if producers:
-                if count_kind(grid, EMPTY) == 0:
-                    print("盤面が満杯で生産できない。停止"); break
-                now = time.time()
-                ready = [p for p in producers if cooldown.get(p, 0) <= now and grid[p]["kind"] == ITEM]
-                if not ready:
-                    wait = max(1, min(cooldown.values()) - now) if cooldown else 5
-                    idle += 1
-                    if idle > args.max_produce:
-                        print("生産機が全部休憩中のまま。停止"); break
-                    wait = min(wait, 30)
-                    print(f"生産機が全部休憩中 → {wait:.0f}秒待機")
-                    time.sleep(wait); continue
-                p = ready[rr % len(ready)]; rr += 1
-                before = count_kind(grid, EMPTY)
-                print(f"合体なし → 生産機 {p} をタップ")
-                if args.dry_run:
-                    time.sleep(1.5); continue
-                # 1回目のタップは「選択」だけのことがあるので、出なければもう1回押す
-                empties = empty_cells(img, grid)
-                out = False
-                for attempt in (1, 2):
-                    tap(grid[p]["center"])
-                    if wait_for_drop(empties):
-                        out = True
-                        break
-                    print(f"  {attempt}回目のタップでは出なかった")
-                if out:
-                    produced += 1
-                    idle = 0
-                    fails[p] = 0
-                    print(f"  生産OK（累計 {produced}）")
+
+        # ---- 生産フェーズ：空きが埋まるまで連打。途中でペアができてもマージしない ----
+        if phase == "produce":
+            room = n_empty - args.keep_empty
+            now = time.time()
+            ready = [p for p in producers if cooldown.get(p, 0) <= now and grid[p]["kind"] == ITEM]
+            if room <= 0 or not ready:
+                if moves:
+                    print(f"→ マージへ（{'空きなし' if room <= 0 else '生産機が全部休憩中'}）")
+                    phase = "merge"
+                elif room <= 0:
+                    print("盤面が満杯でペアも無い。停止"); break
                 else:
-                    # 誤判定もあり得るので、休憩は短く始めて連続失敗で伸ばす（15→30→60…上限 --cooldown）
-                    fails[p] = fails.get(p, 0) + 1
-                    rest = min(args.cooldown, 15 * 2 ** (fails[p] - 1))
-                    cooldown[p] = time.time() + rest
-                    print(f"  {p} は2回押しても出なかった → {rest}秒休ませる（連続{fails[p]}回）")
+                    wait = min(30, max(1, min(cooldown.values()) - now)) if cooldown else 5
+                    idle += 1
+                    if idle > args.max_idle:
+                        print("生産機が全部休憩中のまま。停止"); break
+                    print(f"生産機が全部休憩中 → {wait:.0f}秒待機")
+                    time.sleep(wait)
+                    continue
+            else:
+                if cur not in ready:
+                    cur = ready[0]
+                n = min(args.burst, room)
+                if args.max_produce:
+                    n = min(n, args.max_produce - produced)
+                print(f"生産機 {cur} を {n} 回タップ")
+                if args.dry_run:
+                    time.sleep(1.5); phase = "merge"; continue
+                empties = empty_cells(img, grid)
+                for _ in range(n):
+                    tap(grid[cur]["center"])
+                    time.sleep(args.tap_interval)
+                got = settle_count(empties)
+                produced += got
+                print(f"  {got} 個出た（累計 {produced}）")
+                if got == 0:
+                    # 誤判定もあり得るので休憩は短く始めて連続失敗で伸ばす
+                    fails[cur] = fails.get(cur, 0) + 1
+                    rest = min(args.cooldown, 15 * 2 ** (fails[cur] - 1))
+                    cooldown[cur] = time.time() + rest
+                    print(f"  {cur} 反応なし → {rest}秒休ませる（連続{fails[cur]}回）")
                     if args.save:
                         cv2.imwrite(os.path.expanduser(args.save).replace(".png", "_nodrop.png"), screencap())
+                    cur = None
+                else:
+                    fails[cur] = 0
+                    idle = 0
+                    if got < n - 1:   # 1回分は「選択タップ」の可能性があるので許容
+                        cooldown[cur] = time.time() + args.depleted_rest
+                        print(f"  {cur} は在庫切れっぽい → {args.depleted_rest}秒休ませて次へ")
+                        cur = None
                 if args.max_produce and produced >= args.max_produce:
-                    print(f"{args.max_produce}回生産したので停止"); break
+                    print(f"{args.max_produce}個生産したので、マージだけして停止")
+                    producers = []
+                continue
+
+        # ---- マージフェーズ：ペアが尽きるまで ----
+        if not moves:
+            if producers:
+                phase = "produce"
                 continue
             print("合体できるペアなし。停止"); break
         idle = 0
@@ -486,7 +516,7 @@ def run(args):
                 time.sleep(args.wait)
         if args.dry_run:
             time.sleep(1.5)
-    print(f"合計 {merges} 回マージ / {produced} 回生産")
+    print(f"合計 {merges} 回マージ / {produced} 個生産")
 
 
 def main():
@@ -497,7 +527,12 @@ def main():
     ap.add_argument("--no-view", action="store_true", help="オーバーレイ窓を出さない")
     ap.add_argument("--produce", nargs="+", metavar="COL,ROW",
                     help="生産機のマス（0始まり、複数可 例: --produce 5,3 1,3）。順番にタップ")
-    ap.add_argument("--max-produce", type=int, default=30, help="生産タップの上限回数")
+    ap.add_argument("--max-produce", type=int, default=0, help="生産する個数の上限（0=無制限。エネルギー節約用）")
+    ap.add_argument("--burst", type=int, default=6, help="生産フェーズで1回に連打する回数")
+    ap.add_argument("--tap-interval", type=float, default=0.25, help="連打の間隔秒")
+    ap.add_argument("--keep-empty", type=int, default=0, help="生産で埋めずに残す空きマス数")
+    ap.add_argument("--depleted-rest", type=int, default=30, help="在庫切れっぽい生産機を休ませる秒数")
+    ap.add_argument("--max-idle", type=int, default=20, help="全生産機休憩中の待機を何回で諦めるか")
     ap.add_argument("--cooldown", type=int, default=60, help="何も出なかった生産機を休ませる秒数")
     ap.add_argument("--serial", help="adb接続先（例 127.0.0.1:37123）。1台だけなら省略可")
     ap.add_argument("--start-delay", type=int, default=5 if is_termux() else 0,
