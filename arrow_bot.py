@@ -259,18 +259,24 @@ HANDS_OFF = ("com.termux", "launcher", "com.android.systemui", "com.android.sett
              "incallui", "dialer", "telecom", "com.android.phone")
 
 
+TOP_CMDS = (   # 機種・Androidの版で出力が違うので順に試す
+    "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity|ResumedActivity'; true",
+    "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'; true",
+    "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'; true",
+    "dumpsys activity top | grep -E '^ *ACTIVITY' | tail -n 1; true",
+)
+
+
 def top_activity():
     """前面のActivity。'パッケージ/クラス' の文字列。取れなければ None"""
     import re
-    for cmd in ("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'",
-                "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'"):
+    # 末尾の ; true：grep が何も見つけないと終了コード1になり、adb がそれをエラーとして返すため
+    for cmd in TOP_CMDS:
         try:
             out = kb.adb("shell", cmd, timeout=8)
-        except kb.AdbError:
-            raise
         except Exception:
-            continue
-        m = re.search(r"u\d+ ([\w.]+)/([\w.$]+)", out)
+            continue     # 取れなくても解く処理は止めない（本当の切断は次の画面取得で検知される）
+        m = re.search(r"u\d+ ([\w.]+)/([\w.$]+)", out) or re.search(r"ACTIVITY ([\w.]+)/([\w.$]+)", out)
         if m:
             pkg, cls = m.groups()
             return f"{pkg}/{pkg + cls if cls.startswith('.') else cls}"
@@ -403,63 +409,71 @@ def run(args):
         if os.path.exists(stop_file):
             print("停止ファイルを検出")
             break
-        if state == "seek" and game and not args.no_ad:
-            comp = top_activity()
-            kind = ad_kind(comp, game, recent_ad=time.time() - last_ad < 30)
-            if kind != "game":
-                now = time.time()
-                if ad is None or ad["comp"] != comp:
-                    ad = dict(comp=comp, t0=now, backs=0, taps=0, last_act=0, sampled=False, kind=kind, n=0,
-                              tried={}, dead=[])
-                    print(f"広告/別画面: {comp}（{kind}）")
-                if kind == "away":
-                    # 自分で別アプリを使っている間は何もしない（戻すと邪魔になる）
-                    if now - ad["t0"] > args.away_stop:
-                        print(f"{args.away_stop:.0f}秒ゲームに戻らないので停止")
+        try:
+            if state == "seek" and game and not args.no_ad:
+                comp = top_activity()
+                kind = ad_kind(comp, game, recent_ad=time.time() - last_ad < 30)
+                if kind != "game":
+                    now = time.time()
+                    if ad is None or ad["comp"] != comp:
+                        ad = dict(comp=comp, t0=now, backs=0, taps=0, last_act=0, sampled=False, kind=kind, n=0,
+                                  tried={}, dead=[])
+                        print(f"広告/別画面: {comp}（{kind}）")
+                    if kind == "away":
+                        # 自分で別アプリを使っている間は何もしない（戻すと邪魔になる）
+                        if now - ad["t0"] > args.away_stop:
+                            print(f"{args.away_stop:.0f}秒ゲームに戻らないので停止")
+                            break
+                        time.sleep(1.0)
+                        continue
+                    if not ad["sampled"] and now - ad["t0"] > 1.0:
+                        ad_sample(args, kind, comp)
+                        ad["sampled"] = True
+                    if kind == "ad":
+                        last_ad = now
+                        if now - ad["last_act"] >= args.ad_back:
+                            # 閉じる/スキップの丸ボタンがあれば押す。なければ戻る。
+                            # 同じ所を押しても閉じない時のため、ボタンと戻るを交互に試す
+                            btn = find_close_button(kb.screencap(), ad["dead"], game_ref) if ad["n"] % 2 == 0 else None
+                            if btn:
+                                kb.tap(btn)
+                                ad["taps"] += 1
+                                hit = ad["tried"].setdefault(btn, 0) + 1
+                                ad["tried"][btn] = hit
+                                print(f"  閉じるボタンらしき所をタップ {btn}")
+                                if hit >= 2:
+                                    ad["dead"].append(btn)   # 2回押しても閉じない所は以後押さない
+                            else:
+                                back()
+                                ad["backs"] += 1
+                            ad["n"] += 1
+                            ad["last_act"] = now
+                    if now - ad["t0"] > args.ad_timeout:
+                        ad_sample(args, "timeout", comp)
+                        print(f"{args.ad_timeout:.0f}秒閉じられないので停止（スクショを {args.ad_dir} に保存）")
                         break
-                    time.sleep(1.0)
+                    waiting = 0
+                    time.sleep(0.5)
                     continue
-                if not ad["sampled"] and now - ad["t0"] > 1.0:
-                    ad_sample(args, kind, comp)
-                    ad["sampled"] = True
-                if kind == "ad":
-                    last_ad = now
-                    if now - ad["last_act"] >= args.ad_back:
-                        # 閉じる/スキップの丸ボタンがあれば押す。なければ戻る。
-                        # 同じ所を押しても閉じない時のため、ボタンと戻るを交互に試す
-                        btn = find_close_button(kb.screencap(), ad["dead"], game_ref) if ad["n"] % 2 == 0 else None
-                        if btn:
-                            kb.tap(btn)
-                            ad["taps"] += 1
-                            hit = ad["tried"].setdefault(btn, 0) + 1
-                            ad["tried"][btn] = hit
-                            print(f"  閉じるボタンらしき所をタップ {btn}")
-                            if hit >= 2:
-                                ad["dead"].append(btn)   # 2回押しても閉じない所は以後押さない
-                        else:
-                            back()
-                            ad["backs"] += 1
-                        ad["n"] += 1
-                        ad["last_act"] = now
-                if now - ad["t0"] > args.ad_timeout:
-                    ad_sample(args, "timeout", comp)
-                    print(f"{args.ad_timeout:.0f}秒閉じられないので停止（スクショを {args.ad_dir} に保存）")
-                    break
-                waiting = 0
-                time.sleep(0.5)
-                continue
-            if ad:
-                if ad["kind"] == "away":
-                    print("ゲームに戻ってきた")
-                else:
-                    print(f"広告を閉じた（{time.time() - ad['t0']:.1f}秒 / ボタン{ad['taps']}回 / 戻る{ad['backs']}回）")
-                with open(os.path.expanduser(args.ad_log), "a", encoding="utf-8") as f:
-                    f.write(f"{time.strftime('%F %T')},closed_{ad['kind']},{ad['comp']},{time.time() - ad['t0']:.1f}s,btn{ad['taps']},back{ad['backs']}\n")
-                ad = None
-                if finish_at:
-                    break
-            if finish_at and time.time() - finish_at > args.ad_grace:
-                break        # 指定面数クリア後、広告が出なかった
+                if ad:
+                    if ad["kind"] == "away":
+                        print("ゲームに戻ってきた")
+                    else:
+                        print(f"広告を閉じた（{time.time() - ad['t0']:.1f}秒 / ボタン{ad['taps']}回 / 戻る{ad['backs']}回）")
+                    with open(os.path.expanduser(args.ad_log), "a", encoding="utf-8") as f:
+                        f.write(f"{time.strftime('%F %T')},closed_{ad['kind']},{ad['comp']},{time.time() - ad['t0']:.1f}s,btn{ad['taps']},back{ad['backs']}\n")
+                    ad = None
+                    if finish_at:
+                        break
+                if finish_at and time.time() - finish_at > args.ad_grace:
+                    break        # 指定面数クリア後、広告が出なかった
+        except kb.AdbError:
+            raise
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"広告処理でエラー（{e}）→ 広告処理を切って解くのは続ける")
+            args.no_ad = True
         img = kb.screencap()
         board, waves, stuck, err = analyze(img, grid if state == "play" else None)
         has = not err and board["bars"]
@@ -568,6 +582,7 @@ def main():
     ap.add_argument("--levels", type=int, default=1, help="この面数クリアしたら停止（0=無制限。次の面は自分で開く）")
     ap.add_argument("--tap-wait", type=float, default=TAP_WAIT, help="同じ波の中のタップ間隔（秒）")
     ap.add_argument("--wave-wait", type=float, default=WAVE_WAIT, help="波と波の間の待ち（秒）")
+    ap.add_argument("--top", action="store_true", help="前面の画面名が取れるか確認（ゲームを開いて3秒後に実行される）")
     ap.add_argument("--no-ad", action="store_true", help="広告処理をしない")
     ap.add_argument("--ad-back", type=float, default=2.0, help="広告中に閉じる操作をする間隔（秒）")
     ap.add_argument("--away-stop", type=float, default=600, help="別アプリを開いたままこの秒数たったら停止")
@@ -585,6 +600,19 @@ def main():
                     if kb.is_termux() else "arrow_bot_latest.png", help="毎回の解答画像の保存先")
     args = ap.parse_args()
     kb.SERIAL = args.serial
+    if args.top:
+        if not kb.online_devices():
+            kb.auto_connect()
+        print(f"{args.start_delay}秒後に調べる。今のうちにゲーム画面へ")
+        time.sleep(args.start_delay)
+        for cmd in TOP_CMDS:
+            try:
+                out = kb.adb("shell", cmd, timeout=8).strip()
+            except Exception as e:
+                out = f"(エラー {e})"
+            print(f"$ {cmd}\n{out[:300] or '(何も出ない)'}\n")
+        print("→ 判定結果:", top_activity())
+        return
     if args.analyze:
         img = cv2.imread(args.analyze)
         if img is None:

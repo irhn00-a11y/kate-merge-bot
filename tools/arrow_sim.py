@@ -104,13 +104,19 @@ ADC = "com.example.arrows/com.applovin.adview.AppLovinFullscreenActivity"
 AD = os.environ.get("AD", "")          # AD=1 でクリア後に広告。戻る2回まではカウントダウン中で無視
 STORE = os.environ.get("STORE", "")    # STORE=1 で広告の1回目の戻るがストアに飛ばされる
 ad_state = dict(on=False, backs=0, store=False, shown=0, away=0)
-AWAY = os.environ.get("AWAY", "")      # AWAY=1 でクリア後しばらく Claude アプリが前面（戻るを押したらミス）
+AWAY = os.environ.get("AWAY", "")
+GREPFAIL = os.environ.get("GREPFAIL", "")  # GREPFAIL=1 で前面画面名が取れない端末を再現      # AWAY=1 でクリア後しばらく Claude アプリが前面（戻るを押したらミス）
 backs_total = 0
 
 
 def fake_adb(*a, **k):
     global backs_total, misses
     cmd = a[-1]
+    if "dumpsys" in cmd and GREPFAIL:
+        # 実機：grep が何も見つけないと終了コード1 → adb がエラーとして返す
+        if not cmd.rstrip().endswith("true"):
+            raise kb.AdbError("exit 1")
+        return ""
     if "dumpsys" in cmd:
         if AWAY and len(gone) == len(bars) and ad_state["away"] < 6:
             ad_state["away"] += 1
