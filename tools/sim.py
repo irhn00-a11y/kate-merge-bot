@@ -37,7 +37,7 @@ def swipe(p,q,ms=0):
   state['log'].append('M')
 orig_tap=tap
 def tap_logged(p): orig_tap(p); state['log'].append('P')
-k.screencap=render; k.tap=tap_logged; k.swipe=swipe
+k.screencap=render; k.tap=tap_logged; k.swipe=swipe; k.online_devices=lambda: ['sim']
 clock=[0.0];k.time.time=lambda: clock[0]
 def sl(s): clock[0]+=s
 k.time.sleep=sl

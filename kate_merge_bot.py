@@ -447,6 +447,55 @@ def parse_cells(tokens):
 
 
 # ---------------- メインループ ----------------
+class Status:
+    """画面に状態を出す。termux-toast（画面下に数秒の吹き出し）と
+    termux-notification（通知欄に常駐＋停止ボタン）。Termux:API アプリが必要"""
+
+    def __init__(self, toast=False, notify=False, stop_file="~/kate_stop"):
+        import shutil
+        self.toast = toast and shutil.which("termux-toast")
+        self.notify = notify and shutil.which("termux-notification")
+        if (toast or notify) and not (self.toast or self.notify):
+            print("※ termux-toast が見つからない。Termux:API アプリと `pkg install termux-api` が必要")
+        self.stop_file = os.path.expanduser(stop_file)
+        self.last, self.last_t = None, 0.0
+        self.reason = ""
+
+    def _bg(self, *cmd):
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+    def update(self, text, force=False):
+        if text == self.last and not force:
+            return
+        self.last = text
+        now = time.time()
+        if self.toast and (force or now - self.last_t > 1.2):   # 吹き出しの連発を防ぐ
+            self.last_t = now
+            self._bg("termux-toast", "-s", "-g", "bottom", "-b", "black", "-c", "white", f"🤖 {text}")
+        if self.notify:
+            self._bg("termux-notification", "--id", "katebot", "--ongoing", "--alert-once",
+                     "--title", "ケイトbot", "--content", text,
+                     "--button1", "停止", "--button1-action", f"touch {self.stop_file}")
+
+    def final(self, text):
+        """停止理由を記録（表示は done でまとめて1回）"""
+        print(text)
+        self.reason = text
+
+    def done(self, summary):
+        text = "｜".join(t for t in (self.reason, summary) if t)
+        if self.toast:
+            self._bg("termux-toast", "-g", "bottom", "-b", "red", "-c", "white", f"🛑 {text}")
+        if self.notify:
+            self._bg("termux-notification", "--id", "katebot", "--title", "ケイトbot 停止", "--content", text)
+
+
+ST = Status()
+
+
 def count_dropped(empties, img):
     """前は空きだったマスのうち、物が置かれたマスの数"""
     n = 0
@@ -477,6 +526,7 @@ def run(args):
     global SERIAL
     devs = online_devices()
     if not devs and not auto_connect():
+        ST.final("adbにつながらない（ワイヤレスデバッグONを確認）"); ST.done("")
         return
     if devs and not SERIAL:
         SERIAL = devs[0]
@@ -485,11 +535,14 @@ def run(args):
             return _run(args)
         except AdbError as e:
             print(f"\nadbが切れた（{e}）→ 再接続を試す")
+            ST.update("接続切れ → 再接続中", force=True)
             time.sleep(2)
             if not auto_connect():
+                ST.final("再接続できず停止（ワイヤレスデバッグONを確認）"); ST.done("")
                 return
             args.start_delay = 0
-    print("再接続の上限に達したので停止")
+    ST.final("再接続の上限に達したので停止")
+    ST.done("")
 
 
 def _run(args):
@@ -500,6 +553,7 @@ def _run(args):
         print(f"{args.start_delay}秒後に開始。今のうちにゲーム画面へ")
         time.sleep(args.start_delay)
     print(f"開始。止めるには Ctrl+C か `touch {args.stop_file}`")
+    ST.update("開始", force=True)
     idle = hidden = merges = produced = 0
     last_prot = None
     producers = parse_cells(args.produce) if args.produce else []
@@ -510,14 +564,15 @@ def _run(args):
         print(f"生産機: {producers}（マージ・移動しない）")
     while True:
         if os.path.exists(stop_file):
-            print("停止ファイル検出。停止"); break
+            ST.final("停止ファイル検出。停止"); break
         t_cap = time.time()
         img = screencap()
         if not board_visible(img):
             hidden += 1
             print(f"盤面が見えない（ポップアップ/別アプリ？）→待機 {hidden}/{args.max_hidden}")
+            ST.update(f"盤面待ち {hidden}/{args.max_hidden}")
             if hidden >= args.max_hidden:
-                print("盤面が戻らないので停止"); break
+                ST.final("盤面が戻らないので停止"); break
             time.sleep(2); continue
         hidden = 0
         t_an = time.time()
@@ -546,13 +601,14 @@ def _run(args):
                     print(f"→ マージへ（{'空きなし' if room <= 0 else '生産機が全部休憩中'}）")
                     phase = "merge"
                 elif room <= 0:
-                    print("盤面が満杯でペアも無い。停止"); break
+                    ST.final("盤面が満杯でペアも無い。停止"); break
                 else:
                     wait = min(30, max(1, min(cooldown.values()) - now)) if cooldown else 5
                     idle += 1
                     if idle > args.max_idle:
-                        print("生産機が全部休憩中のまま。停止"); break
+                        ST.final("生産機が全部休憩中のまま。停止"); break
                     print(f"生産機が全部休憩中 → {wait:.0f}秒待機")
+                    ST.update(f"生産機休憩中… {wait:.0f}秒待ち", force=True)
                     time.sleep(wait)
                     continue
             else:
@@ -562,6 +618,7 @@ def _run(args):
                 if args.max_produce:
                     n = min(n, args.max_produce - produced)
                 print(f"生産機 {cur} を {n} 回タップ")
+                ST.update(f"生産中（累計{produced}個）")
                 if args.dry_run:
                     time.sleep(1.5); phase = "merge"; continue
                 empties = empty_cells(img, grid)
@@ -597,14 +654,15 @@ def _run(args):
             if producers:
                 phase = "produce"
                 continue
-            print("合体できるペアなし。停止"); break
+            ST.final("合体できるペアなし。停止"); break
         idle = 0
         if args.max_merges and merges >= args.max_merges:
-            print(f"{args.max_merges}回マージしたので停止"); break
+            ST.final(f"{args.max_merges}回マージしたので停止"); break
         # 重ならないペアは1回の読み取りでまとめて実行（マージは他のマスに影響しないため）
         batch = moves[:args.batch]
         if args.max_merges:
             batch = batch[:max(0, args.max_merges - merges)]
+        ST.update(f"マージ中（累計{merges}回）")
         for a, b in batch:
             merges += 1
             print(f"#{merges} merge {a} -> {b}")
@@ -614,6 +672,7 @@ def _run(args):
         if args.dry_run:
             time.sleep(1.5)
     print(f"合計 {merges} 回マージ / {produced} 個生産")
+    ST.done(f"{merges}回マージ / {produced}個生産")
 
 
 def main():
@@ -642,6 +701,8 @@ def main():
     ap.add_argument("--swipe-ms", type=int, default=SWIPE_MS, help="ドラッグ時間ms")
     ap.add_argument("--wait", type=float, default=WAIT_AFTER_MERGE, help="1手ごとの待ち秒")
     ap.add_argument("-v", "--verbose", action="store_true", help="取得・解析の所要時間を表示")
+    ap.add_argument("--toast", action="store_true", help="状態を画面下に吹き出し表示（Termux:API必要）")
+    ap.add_argument("--notify", action="store_true", help="状態を通知欄に常駐表示＋停止ボタン（Termux:API必要）")
     ap.add_argument("--connect", action="store_true", help="adb接続だけ行う（再起動後のポート探しに便利）")
     ap.add_argument("--max-reconnect", type=int, default=5, help="実行中の自動再接続の上限回数")
     ap.add_argument("--ignore-orders", action="store_true", help="注文の品も保護せずマージする")
@@ -651,6 +712,8 @@ def main():
     if is_termux():
         args.no_view = True
 
+    global ST
+    ST = Status(args.toast, args.notify, args.stop_file)
     if args.connect:
         ok = auto_connect()
         print("接続中:", online_devices() if ok else "なし")
