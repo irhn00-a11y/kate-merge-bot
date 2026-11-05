@@ -5,6 +5,8 @@
 - タップ   → 押された棒の頭の先に他の棒が残っていたら「ミス」として数える
   使い方: python tools/arrow_sim.py docs/arrow_board.jpg [arrow_botの引数…]
   AFTER=same でクリア後も盤面そっくりの画面が出続ける最悪ケース、AFTER=next で次の面
+  TRUTH=docs/arrow_board.jpg で正解を別画像から作る（頭を消した画像の検証用）
+  MANUAL=1 で人が読めない棒を手で押す役をする
   AD=1 でクリア後に広告（戻る3回目で閉じる）、AD=btn で戻るが効かずスキップボタンでだけ閉じる広告
   STORE=1 で1回目の戻るでストアに飛ばされる、AWAY=1 でクリア後しばらくClaudeアプリが前面
 """
@@ -19,7 +21,8 @@ import arrow_bot as ab  # noqa: E402
 import kate_merge_bot as kb  # noqa: E402
 
 src = cv2.imread(sys.argv[1])
-board, _ = ab.parse_board(src)
+# TRUTH=きれいな画像：正解（棒の配置）はそこから作り、botには sys.argv[1]（頭を消した等の画像）を見せる
+board, _ = ab.parse_board(cv2.imread(os.environ["TRUTH"]) if os.environ.get("TRUTH") else src)
 bars, P, pitch = board["bars"], board["P"], board["pitch"]
 bg = tuple(int(v) for v in np.median(src[400:500, 40:1040].reshape(-1, 3), 0))
 gone, misses, taps = set(), 0, 0
@@ -43,7 +46,21 @@ def levels_cleared():
 AD_IMG = cv2.imread(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "ad_admob_skip.png"))
 
 
+manual_wait = 0
+
+
 def fake_screencap():
+    global manual_wait
+    if os.environ.get("MANUAL") and len(gone) < len(bars):
+        # 人が押す役：bot が読めない棒しか残っていない時、押せる棒を1本抜く
+        manual_wait += 1
+        if manual_wait > 3:
+            for i in range(len(bars)):
+                if i not in gone and bar_free(i):
+                    gone.add(i)
+                    print("  （人が手で押した）")
+                    break
+            manual_wait = 0
     if ad_state["on"] and os.environ.get("AD") == "btn":
         return AD_IMG.copy()
     img = src.copy()
@@ -72,7 +89,20 @@ def fake_screencap():
     return img
 
 
+def bar_free(i):
+    (c, r), (dc, dr) = bars[i]["head"], bars[i]["d"]
+    c, r = c + dc, r + dr
+    while 0 <= c < board["nx"] and 0 <= r < board["ny"]:
+        j = occ.get((c, r))
+        if j is not None and j != i and j not in gone:
+            return False
+        c, r = c + dc, r + dr
+    return True
+
+
 def fake_tap(p):
+    global manual_wait
+    manual_wait = 0
     global misses, taps
     if ad_state["on"]:
         if os.environ.get("AD") == "btn" and abs(p[0] - 1007) < 40 and abs(p[1] - 153) < 40:

@@ -174,6 +174,11 @@ def solve(board):
     """貪欲法。戻り値: 波のリスト（同じ波の棒は互いに独立）と、抜けない棒"""
     bars, nx, ny = board["bars"], board["nx"], board["ny"]
     occ = {u: i for i, b in enumerate(bars) for u in b["path"]}
+    # 読み取り不良の棒（頭が曖昧・分岐）は「動かせない障害物」として扱う。
+    # これを塞いでいる棒は押さないので、読み違いがあっても誤タップにはならない
+    for comp, _ in board.get("problems", []):
+        for u in comp:
+            occ[u] = -1
     alive = set(range(len(bars)))
 
     def free(i):
@@ -181,7 +186,7 @@ def solve(board):
         c, r = c + dc, r + dr
         while 0 <= c < nx and 0 <= r < ny:
             j = occ.get((c, r))
-            if j is not None and j in alive and j != i:   # 自分の体は無視（要実機確認）
+            if j == -1 or (j is not None and j in alive and j != i):   # 自分の体は無視（要実機確認）
                 return False
             c, r = c + dc, r + dr
         return True
@@ -404,6 +409,7 @@ def run(args):
     ad = None            # 表示中の広告 dict(comp, t0, backs, last_back, sampled)
     finish_at = None     # 指定面数をクリアした時刻。広告が出たら閉じてから止める
     last_ad = 0          # 最後に広告を見た時刻（ストア等を広告の飛び先とみなす判定用）
+    weird = set()        # 直前の読み取りで不良だったマス（後で読めるようになった棒を許す）
     game_ref = None      # ゲーム画面のスクショ（通話の吹き出し等のオーバーレイを広告ボタンと区別する）
     while True:
         if os.path.exists(stop_file):
@@ -476,10 +482,10 @@ def run(args):
             args.no_ad = True
         img = kb.screencap()
         board, waves, stuck, err = analyze(img, grid if state == "play" else None)
-        has = not err and board["bars"]
+        has = not err and (board["bars"] or board["problems"])
 
         if state == "play":
-            if not has or not _paths(board):
+            if not has:
                 # 残りを全部押した後に盤面が消えた → クリア
                 print(f"== クリア（{levels + 1}面目 / {time.time() - t_level:.1f}秒） ==" if not alive
                       else "== 盤面が消えた（途中）→ 新しい面を待つ ==")
@@ -490,7 +496,8 @@ def run(args):
                         break
                     finish_at = time.time()
                 continue
-            if not _paths(board) <= alive or board["problems"]:
+            # 読み直した棒は「残っていた棒」か「さっき読めなかった所の棒（読めるようになった）」のはず
+            if not all(p in alive or set(p) <= weird for p in _paths(board)):
                 # 想定外の棒が増えた＝クリア画面や次の面、または読み違い → 押さない
                 print("盤面が想定と違う → 押さずに様子見")
                 if not alive:
@@ -505,7 +512,7 @@ def run(args):
                 time.sleep(args.poll)
                 continue
         else:  # seek
-            ok = has and not board["problems"] and not stuck and waves
+            ok = has and waves and (not stuck or board["problems"])
             if not ok:
                 if has and board["problems"]:
                     bad += 1
@@ -554,7 +561,28 @@ def run(args):
                 game_ref = img      # 広告中に「ゲーム画面にもある丸」を除外するための見本
             report(board, waves, stuck)
 
+        weird = {u for comp, _ in board["problems"] for u in comp}
+        if board["problems"]:
+            print(f"  読み取り不良{len(board['problems'])}本は障害物として扱い、他を解く")
         save(args.save, annotate(img, board, waves, stuck))
+        if not waves and board["problems"] and state == "play" and not args.dry_run:
+            # 残りは読めない棒に塞がれている → 手で押してもらうのを待って再開
+            waiting += 1
+            if waiting == 1:
+                report(board, waves, stuck)
+                print(f"読めない棒（画像のピンク）を手で押して。押したら続きを自動で解く。画像: {args.save}")
+                if hasattr(kb, "subprocess"):
+                    try:
+                        kb.subprocess.Popen(["termux-toast", "-g", "bottom", "読めない棒を手で押して"],
+                                            stdout=kb.subprocess.DEVNULL, stderr=kb.subprocess.DEVNULL)
+                    except Exception:
+                        pass
+            if waiting * args.poll > args.idle_stop:
+                print(f"{args.idle_stop}秒待ったので停止")
+                break
+            time.sleep(args.poll)
+            continue
+        waiting = 0
         if not waves:
             report(board, waves, stuck)
             print("抜ける棒がない（読み違いか、ルール解釈違い）→ 停止")
