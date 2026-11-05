@@ -41,7 +41,7 @@ k.screencap=render; k.tap=tap_logged; k.swipe=swipe; k.online_devices=lambda: ['
 clock=[0.0];k.time.time=lambda: clock[0]
 def sl(s): clock[0]+=s
 k.time.sleep=sl
-args=types.SimpleNamespace(stop_file='/tmp/kate_sim_stop',start_delay=0,ignore_orders=True,save=None,no_view=True,produce=['5,3'],max_produce=0,cooldown=60,dry_run=False,max_hidden=15,max_merges=0,batch=8,swipe_ms=150,wait=0.35,verbose=False,burst=6,tap_interval=0.25,keep_empty=0,depleted_rest=30,max_idle=3)
+args=types.SimpleNamespace(stop_file='/tmp/kate_sim_stop',start_delay=0,ignore_orders=True,save=None,no_view=True,produce=['5,3'],max_produce=0,cooldown=60,dry_run=False,max_hidden=15,max_merges=0,batch=8,swipe_ms=150,wait=0.35,verbose=False,burst=6,tap_interval=0.25,keep_empty=0,depleted_rest=30,max_idle=3,max_reconnect=0)
 import io,contextlib
 buf=io.StringIO()
 with contextlib.redirect_stdout(buf): k.run(args)
