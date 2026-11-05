@@ -39,7 +39,9 @@ ORDER_MIN_X = 230         # これより左はスパナボタン等なので除�
 SWIPE_MS = 150            # ドラッグ時間
 WAIT_AFTER_MERGE = 0.35   # 1手ごとの待ち
 BATCH = 8                 # 1回の盤面読み取りで実行する最大手数（重ならないペアをまとめて実行）
-PRODUCE_WAIT = 1.0        # 生産タップ後、アイテムが飛び出すのを待つ秒数
+PRODUCE_TIMEOUT = 2.5     # 生産タップ後、アイテムが着地するのを最大何秒見張るか
+PRODUCE_POLL = 0.35       # 見張る間隔
+CHANGE_DIFF = 18          # 空きマスの画素がこれ以上変わったら「何か置かれた」とみなす
 
 EMPTY, BOX, JAR, ITEM = "empty", "box", "jar", "item"
 
@@ -335,6 +337,35 @@ def is_termux():
     return "com.termux" in os.environ.get("PREFIX", "")
 
 
+def empty_cells(img, grid):
+    """空きマスの中央部の画像（生産品が着地したかの比較用）"""
+    x0, y0, x1, y1 = board_rect(img)
+    cw, ch = (x1 - x0) / COLS, (y1 - y0) / ROWS
+    out = {}
+    for key, v in grid.items():
+        if key == "_orders" or v["kind"] != EMPTY:
+            continue
+        c, r = key
+        a, b = int(x0 + (c + .2) * cw), int(y0 + (r + .2) * ch)
+        out[key] = (a, b, int(cw * .6), int(ch * .6), img[b:b + int(ch * .6), a:a + int(cw * .6)].astype(np.int16))
+    return out
+
+
+def wait_for_drop(empties, timeout=PRODUCE_TIMEOUT):
+    """どれかの空きマスに物が置かれるまで見張る。着地アニメが遅くても取りこぼさない"""
+    if not empties:
+        return False
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(PRODUCE_POLL)
+        img = screencap()
+        for a, b, w, h, ref in empties.values():
+            cur = img[b:b + h, a:a + w].astype(np.int16)
+            if cur.shape == ref.shape and np.abs(cur - ref).mean() > CHANGE_DIFF:
+                return True
+    return False
+
+
 def count_kind(grid, kind):
     return sum(1 for k, v in grid.items() if k != "_orders" and v["kind"] == kind)
 
@@ -366,6 +397,7 @@ def run(args):
     last_prot = None
     producers = parse_cells(args.produce) if args.produce else []
     cooldown = {}
+    fails = {}
     if producers:
         print(f"生産機: {producers}（マージ・移動しない）")
     while True:
@@ -405,30 +437,36 @@ def run(args):
                     idle += 1
                     if idle > args.max_produce:
                         print("生産機が全部休憩中のまま。停止"); break
+                    wait = min(wait, 30)
                     print(f"生産機が全部休憩中 → {wait:.0f}秒待機")
-                    time.sleep(min(wait, 30)); continue
+                    time.sleep(wait); continue
                 p = ready[rr % len(ready)]; rr += 1
                 before = count_kind(grid, EMPTY)
                 print(f"合体なし → 生産機 {p} をタップ")
                 if args.dry_run:
                     time.sleep(1.5); continue
                 # 1回目のタップは「選択」だけのことがあるので、出なければもう1回押す
+                empties = empty_cells(img, grid)
                 out = False
                 for attempt in (1, 2):
                     tap(grid[p]["center"])
-                    time.sleep(PRODUCE_WAIT)
-                    g2, _ = analyze(screencap(), protect_orders=False, producers=producers)
-                    if count_kind(g2, EMPTY) < before:
+                    if wait_for_drop(empties):
                         out = True
                         break
                     print(f"  {attempt}回目のタップでは出なかった")
                 if out:
                     produced += 1
                     idle = 0
+                    fails[p] = 0
                     print(f"  生産OK（累計 {produced}）")
                 else:
-                    cooldown[p] = time.time() + args.cooldown
-                    print(f"  {p} は2回押しても出なかった → {args.cooldown}秒休ませる")
+                    # 誤判定もあり得るので、休憩は短く始めて連続失敗で伸ばす（15→30→60…上限 --cooldown）
+                    fails[p] = fails.get(p, 0) + 1
+                    rest = min(args.cooldown, 15 * 2 ** (fails[p] - 1))
+                    cooldown[p] = time.time() + rest
+                    print(f"  {p} は2回押しても出なかった → {rest}秒休ませる（連続{fails[p]}回）")
+                    if args.save:
+                        cv2.imwrite(os.path.expanduser(args.save).replace(".png", "_nodrop.png"), screencap())
                 if args.max_produce and produced >= args.max_produce:
                     print(f"{args.max_produce}回生産したので停止"); break
                 continue
