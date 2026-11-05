@@ -131,7 +131,7 @@ def parse_board(img, grid=None):
             sc += int(dark(x - dc * 2 * k + sg * dr * 14 * k, y - dr * 2 * k + sg * dc * 14 * k, 2))
         return sc
 
-    seen, bars, problems = set(), [], []
+    seen, bars, problems, noise = set(), [], [], []
     for u0 in nodes:
         if u0 in seen:
             continue
@@ -144,7 +144,10 @@ def parse_board(img, grid=None):
             comp.append(u)
             st += adj[u]
         ends = [u for u in comp if len(adj[u]) == 1]
-        if len(comp) == 1 or len(ends) != 2 or any(len(adj[u]) > 2 for u in comp):
+        if len(comp) == 1:
+            noise.append(comp[0])   # 1点だけ＝棒ではない（通話の吹き出し等のオーバーレイ、ゴミ）
+            continue
+        if len(ends) != 2 or any(len(adj[u]) > 2 for u in comp):
             problems.append((comp, "分岐/交差"))
             continue
         sc = []
@@ -164,7 +167,7 @@ def parse_board(img, grid=None):
             nxt = [v for v in adj[u] if v != prev][0]
             prev, _ = u, path.append(nxt)
         bars.append(dict(path=path, head=head, d=d))
-    return dict(bars=bars, problems=problems, nx=nx, ny=ny, P=P, pitch=px, grid=grid), None
+    return dict(bars=bars, problems=problems, noise=noise, nx=nx, ny=ny, P=P, pitch=px, grid=grid), None
 
 
 def solve(board):
@@ -214,6 +217,8 @@ def annotate(img, board, waves, stuck):
     for i in stuck:
         for u in board["bars"][i]["path"]:
             cv2.circle(out, tuple(int(v) for v in P(*u)), 6, (0, 0, 255), -1)
+    for u in board["noise"]:
+        cv2.circle(out, tuple(int(v) for v in P(*u)), 8, (160, 160, 160), 2)
     for comp, _ in board["problems"]:
         for u in comp:
             cv2.circle(out, tuple(int(v) for v in P(*u)), 6, (255, 0, 255), -1)
@@ -232,6 +237,8 @@ def report(board, waves, stuck):
     n = sum(map(len, waves))
     print(f"グリッド {board['nx']}x{board['ny']}  マス幅 {board['pitch']:.1f}px  棒 {len(board['bars'])}本")
     print(f"解答 {n}手 / {len(waves)}波  抜けない棒 {len(stuck)}  読み取り不良 {len(board['problems'])}")
+    if board["noise"]:
+        print(f"  無視した点（棒ではない）: {board['noise']}")
     for comp, why in board["problems"]:
         print("  不良:", why, sorted(comp)[:3], "…")
 
