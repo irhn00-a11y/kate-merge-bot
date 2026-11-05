@@ -29,11 +29,11 @@ import kate_merge_bot as kb  # noqa: E402  adb / screencap / auto_connect / is_t
 
 # ===== 1080x2340 基準の値（解像度が違えば高さ比で換算） =====
 REF_H = 2340
-SEARCH_Y = (345, 2000)   # 盤面を探す縦範囲（上のヘッダ線より下、下のボタンより上）
+SEARCH_Y = (385, 2000)   # 盤面を探す縦範囲（上の「HARD」等の文字・ヘッダ線より下、下のボタンより上）
 DARK = 120               # これより暗い画素を「線」とみなす
 REF_PITCH = 43.7         # 判定オフセットの基準にしたマス幅
 TAP_WAIT = 0.12          # 同じ波の中でのタップ間隔（v2で0.35→0.12）
-WAVE_WAIT = 0.4          # 波と波の間（前の棒が抜けきるのを待つ。v2で0.8→0.4）
+WAVE_WAIT = 0.0          # 波と波の間の追加の待ち（v10から「前の棒が消えたのを画面で確認」するので0）
 
 
 # ---------------- 盤面解析 ----------------
@@ -50,40 +50,70 @@ def _runs(on):
     return out
 
 
-def _fit_axis(B, axis, lo, hi, line_w):
-    """線の中心が並ぶ等間隔グリッドを当てはめる。戻り値 (原点, ピッチ, 個数) """
+def _centers(B, axis, line_w):
+    """投影から線の中心候補（線幅くらいの細いラン）を拾う"""
     prof = B.sum(axis)
     thr = max(5, 0.25 * np.percentile(prof[prof > 0], 90)) if (prof > 0).any() else 5
     cs = [(a + b) / 2 for a, b in _runs(prof > thr) if line_w * 0.5 <= b - a + 1 <= line_w * 1.8]
-    if len(cs) < 3:
-        return None
-    cs = np.array(cs)
-    # ピッチ：線の中心が最もよく揃う周期を探す（線幅の2〜6倍の範囲。半分・倍の周期は範囲外）
-    ps = np.arange(line_w * 2, line_w * 6, 0.05)
-    score = [abs(np.exp(2j * np.pi * cs / p).sum()) for p in ps]
-    p = ps[int(np.argmax(score))]
-    phase = np.angle(np.exp(2j * np.pi * cs / p).sum()) / (2 * np.pi) * p
-    k = np.round((cs - phase) / p)
-    # 線の中心をグリッド番号に対して最小二乗フィット（ズレていた点は除外）
-    ok = np.abs(cs - phase - k * p) < line_w * 0.6
-    A = np.vstack([np.ones(ok.sum()), k[ok]]).T
-    (c0, p), *_ = np.linalg.lstsq(A, cs[ok], rcond=None)
-    # 外周は先端の突き出し（<半マス）を考慮して点の範囲から決める
+    return np.array(cs), prof
+
+
+def _pitch(cs_list, line_w):
+    """縦横の線の中心が最もよく揃う周期（マスは正方形なので縦横まとめて1つ）"""
+    ps = np.arange(line_w * 2, line_w * 6, 0.02)
+    score = sum(np.abs(np.exp(2j * np.pi * cs[None, :] / ps[:, None]).sum(1)) for cs in cs_list if len(cs))
+    return float(ps[int(np.argmax(score))])
+
+
+def _fit_grid(csx, csy, p, line_w):
+    """縦横の線の中心を、共通ピッチ p の等間隔グリッドへ同時に最小二乗フィット。
+    片方の軸の点が少なくても（横線が密で投影が潰れる等）もう片方がピッチを支える。戻り値 (x原点, y原点, ピッチ)"""
+    c = [np.angle(np.exp(2j * np.pi * cs / p).sum()) / (2 * np.pi) * p if len(cs) else 0.0 for cs in (csx, csy)]
+    for _ in range(4):
+        rows, rhs = [], []
+        for ax, cs in enumerate((csx, csy)):
+            if not len(cs):
+                continue
+            k = np.round((cs - c[ax]) / p)
+            ok = np.abs(cs - c[ax] - k * p) < line_w * 0.6
+            for kk, v in zip(k[ok], cs[ok]):
+                rows.append([1.0 if ax == 0 else 0.0, 1.0 if ax == 1 else 0.0, kk])
+                rhs.append(v)
+        if len(rows) < 4:
+            return None
+        sol, *_ = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)
+        c = [sol[0], sol[1]]
+        p = sol[2]
+    return c[0], c[1], p
+
+
+def _extent(prof, lo, c0, p):
+    """外周は先端の突き出し（<半マス）を考慮して点の範囲から決める。戻り値 (原点, 個数)"""
     idx = np.nonzero(prof > 0)[0]
     first = int(np.ceil((idx[0] - c0) / p - 0.05))
     last = int(np.floor((idx[-1] - c0) / p + 0.05))
-    return lo + c0 + first * p, p, last - first + 1
+    return lo + c0 + first * p, last - first + 1
+
+
+def line_mask(img):
+    """棒の画素マスク：黒い線＋赤い線（ミスした棒はゲームが赤く表示する。赤は暗くないので別に拾う）"""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    H = g.shape[0]
+    s = H / REF_H
+    y_lo, y_hi = int(SEARCH_Y[0] * s), int(SEARCH_Y[1] * s)
+    B = np.zeros_like(g, bool)
+    band = img[y_lo:y_hi].astype(np.int16)
+    red = (band[..., 2] > 170) & (band[..., 2] - band[..., 1] > 70) & (band[..., 2] - band[..., 0] > 70)
+    B[y_lo:y_hi] = (g[y_lo:y_hi] < DARK) | red
+    return B
 
 
 def parse_board(img, grid=None):
     """盤面を読む。戻り値 (dict(bars, nx, ny, P, grid…), None) か、読めなければ (None, 理由)
     grid を渡すとグリッド推定を省いてそれを使う（棒が減ると推定が不安定になるため、面の最初に読んだものを固定）"""
-    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    H, W = g.shape
+    B = line_mask(img)
+    H, W = B.shape
     s = H / REF_H
-    y_lo, y_hi = int(SEARCH_Y[0] * s), int(SEARCH_Y[1] * s)
-    B = np.zeros_like(g, bool)
-    B[y_lo:y_hi] = g[y_lo:y_hi] < DARK
     if B.sum() < 300 * s * s:
         return None, "盤面なし"
     if grid is None:
@@ -94,11 +124,17 @@ def parse_board(img, grid=None):
         # 線幅の目安：短い黒ランの中央値
         rl = [b - a + 1 for row in sub[::7] for a, b in _runs(row)]
         line_w = float(np.median(rl)) if rl else 12
-        fx = _fit_axis(sub, 0, xs.min(), xs.max(), line_w)
-        fy = _fit_axis(sub, 1, ys.min(), ys.max(), line_w)
-        if not fx or not fy:
+        csx, prx = _centers(sub, 0, line_w)
+        csy, pry = _centers(sub, 1, line_w)
+        if len(csx) + len(csy) < 6:
             return None, "グリッド検出失敗"
-        grid = fx + fy
+        p0 = _pitch([csx, csy], line_w)
+        fit = _fit_grid(csx, csy, p0, line_w)
+        if not fit:
+            return None, "グリッド検出失敗"
+        cx0, cy0, p = fit
+        (x0, nx), (y0, ny) = _extent(prx, xs.min(), cx0, p), _extent(pry, ys.min(), cy0, p)
+        grid = (x0, p, nx, y0, p, ny)
     (x0, px, nx, y0, py, ny) = grid
     if abs(px - py) > 0.1 * px or nx < 2 or ny < 2:
         return None, f"グリッドが不自然 px={px:.1f} py={py:.1f}"
@@ -191,6 +227,18 @@ def solve(board):
             c, r = c + dc, r + dr
         return True
 
+    # 各棒の進路上にいる棒（＝その棒より先に抜けている必要がある棒）
+    blk = {}
+    for i in range(len(bars)):
+        (c, r), (dc, dr) = bars[i]["head"], bars[i]["d"]
+        c, r, st = c + dc, r + dr, set()
+        while 0 <= c < nx and 0 <= r < ny:
+            j = occ.get((c, r))
+            if j is not None and j >= 0 and j != i:
+                st.add(j)
+            c, r = c + dc, r + dr
+        blk[i] = st
+    board["blockers"] = blk
     waves = []
     while alive:
         w = [i for i in sorted(alive) if free(i)]
@@ -372,6 +420,33 @@ def tap_many(points, gap):
         return kb.tap(points[0])
     cmd = f"; sleep {gap:.2f}; ".join(f"input tap {x} {y}" for x, y in points)
     kb.adb("shell", cmd, timeout=10 + len(points) * (gap + 1))
+
+
+def wait_gone(board, ids, present, timeout):
+    """ids の棒が画面から消える（抜けるアニメが終わる）まで待つ。
+    見るのは各棒の元の位置と進路上のマスのうち、まだ残っている棒 present・読めない棒が居ないマス。
+    戻り値: 消えたら True、timeout 秒たっても残っていたら False"""
+    bars, P, nx, ny = board["bars"], board["P"], board["nx"], board["ny"]
+    keep = {u for j in present for u in bars[j]["path"]} | {u for comp, _ in board["problems"] for u in comp}
+    cells = set()
+    for i in ids:
+        cells |= set(bars[i]["path"])
+        (c, r), (dc, dr) = bars[i]["head"], bars[i]["d"]
+        c, r = c + dc, r + dr
+        while 0 <= c < nx and 0 <= r < ny:
+            cells.add((c, r))
+            c, r = c + dc, r + dr
+    pts = [tuple(int(round(v)) for v in P(*u)) for u in cells - keep]
+    t0 = time.time()
+    while True:
+        B = line_mask(kb.screencap())
+        H, W = B.shape
+        if not any(B[max(0, y - 3):y + 4, max(0, x - 3):x + 4].mean() > 0.5
+                   for x, y in pts if 0 <= x < W and 0 <= y < H):
+            return True
+        if time.time() - t0 > timeout:
+            return False
+        time.sleep(0.05)
 
 
 def save(path, img):
@@ -592,13 +667,20 @@ def run(args):
             print(f"dry-run: 解答画像を保存 → {args.save}")
             break
         print(f"棒{len(board['bars'])}本 → {sum(map(len, plan))}手実行")
+        tapped, untapped = set(), set(range(len(board["bars"])))
         for wi, w in enumerate(plan):
+            # この波の棒を塞いでいた棒が、実際に画面から消えたのを確かめてから押す（アニメ中に押すとミスになる）
+            need = set().union(*(board["blockers"][i] for i in w)) & tapped
+            if need and not wait_gone(board, need, untapped - tapped, args.gone_timeout):
+                print(f"  前の棒が{args.gone_timeout}秒たっても消えない → 押さずに読み直す")
+                break
+            if args.wave_wait:
+                time.sleep(args.wave_wait)
             tap_many([tap_point(board, i) for i in w], args.tap_wait)
             taps += len(w)
-            if wi < len(plan) - 1:
-                time.sleep(args.wave_wait)
-        alive = _paths(board) - {tuple(board["bars"][i]["path"]) for w in plan for i in w}
-        time.sleep(args.wave_wait)   # 抜けきってから読み直す（残っていれば続きを解く）
+            tapped |= set(w)
+        alive = _paths(board) - {tuple(board["bars"][i]["path"]) for i in tapped}
+        wait_gone(board, tapped, untapped - tapped, args.gone_timeout)   # 抜けきってから読み直す
     print(f"合計 {taps}タップ / {levels}面")
 
 
@@ -609,6 +691,7 @@ def main():
     ap.add_argument("--step", action="store_true", help="1タップごとに読み直す（慎重モード）")
     ap.add_argument("--levels", type=int, default=1, help="この面数クリアしたら停止（0=無制限。次の面は自分で開く）")
     ap.add_argument("--tap-wait", type=float, default=TAP_WAIT, help="同じ波の中のタップ間隔（秒）")
+    ap.add_argument("--gone-timeout", type=float, default=4.0, help="前の棒が消えるのを待つ上限（秒）")
     ap.add_argument("--wave-wait", type=float, default=WAVE_WAIT, help="波と波の間の待ち（秒）")
     ap.add_argument("--top", action="store_true", help="前面の画面名が取れるか確認（ゲームを開いて3秒後に実行される）")
     ap.add_argument("--no-ad", action="store_true", help="広告処理をしない")

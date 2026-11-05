@@ -6,6 +6,7 @@
   使い方: python tools/arrow_sim.py docs/arrow_board.jpg [arrow_botの引数…]
   AFTER=same でクリア後も盤面そっくりの画面が出続ける最悪ケース、AFTER=next で次の面
   TRUTH=docs/arrow_board.jpg で正解を別画像から作る（頭を消した画像の検証用）
+  ANIM=3 で押した棒が画面取得3回のあいだ残る（抜けるアニメ）
   MANUAL=1 で人が読めない棒を手で押す役をする
   AD=1 でクリア後に広告（戻る3回目で閉じる）、AD=btn で戻るが効かずスキップボタンでだけ閉じる広告
   STORE=1 で1回目の戻るでストアに飛ばされる、AWAY=1 でクリア後しばらくClaudeアプリが前面
@@ -26,6 +27,8 @@ board, _ = ab.parse_board(cv2.imread(os.environ["TRUTH"]) if os.environ.get("TRU
 bars, P, pitch = board["bars"], board["P"], board["pitch"]
 bg = tuple(int(v) for v in np.median(src[400:500, 40:1040].reshape(-1, 3), 0))
 gone, misses, taps = set(), 0, 0
+moving = {}   # ANIM=n：押した棒は画面取得n回のあいだ残り、他の棒の進路を塞ぎ続ける（抜けるアニメ）
+ANIM = int(os.environ.get("ANIM", "0"))
 blank_reads = 0
 occ = {u: i for i, b in enumerate(bars) for u in b["path"]}
 
@@ -51,6 +54,11 @@ manual_wait = 0
 
 def fake_screencap():
     global manual_wait
+    for i in list(moving):
+        moving[i] -= 1
+        if moving[i] <= 0:
+            del moving[i]
+            gone.add(i)
     if os.environ.get("MANUAL") and len(gone) < len(bars):
         # 人が押す役：bot が読めない棒しか残っていない時、押せる棒を1本抜く
         manual_wait += 1
@@ -64,7 +72,7 @@ def fake_screencap():
     if ad_state["on"] and os.environ.get("AD") == "btn":
         return AD_IMG.copy()
     img = src.copy()
-    if len(gone) == len(bars) and AD and ad_state["shown"] < levels_cleared():
+    if len(gone) == len(bars) and not moving and AD and ad_state["shown"] < levels_cleared():
         ad_state.update(on=True, backs=0, shown=ad_state["shown"] + 1)
     if len(gone) == len(bars):          # クリア後
         if AFTER == "same":             # 最悪ケース：クリア後も盤面そっくりの画面が出続ける
@@ -123,10 +131,15 @@ def fake_tap(p):
         j = occ.get((c, r))
         if j is not None and j != i and j not in gone:
             misses += 1
-            print("  !! 塞がれた棒を押した", p)
+            print("  !! 塞がれた棒を押した", p, "（アニメ中の棒に塞がれていた）" if j in moving else "")
             return
         c, r = c + dc, r + dr
-    gone.add(i)
+    if i in moving:
+        return
+    if ANIM:
+        moving[i] = ANIM
+    else:
+        gone.add(i)
 
 
 GAME = "com.example.arrows/com.unity3d.player.UnityPlayerActivity"
