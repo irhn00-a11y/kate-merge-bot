@@ -7,6 +7,7 @@
   AFTER=same でクリア後も盤面そっくりの画面が出続ける最悪ケース、AFTER=next で次の面
   TRUTH=docs/arrow_board.jpg で正解を別画像から作る（頭を消した画像の検証用）
   ANIM=3 で押した棒が画面取得3回のあいだ残る（抜けるアニメ）
+  GLITCH=5 で残り5本以下の所で1回だけ盤面が読めない画面、SCREENOFF=20 で20タップ後に画面オフ
   MANUAL=1 で人が読めない棒を手で押す役をする
   AD=1 でクリア後に広告（戻る3回目で閉じる）、AD=btn で戻るが効かずスキップボタンでだけ閉じる広告
   STORE=1 で1回目の戻るでストアに飛ばされる、AWAY=1 でクリア後しばらくClaudeアプリが前面
@@ -52,8 +53,17 @@ AD_IMG = cv2.imread(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..
 manual_wait = 0
 
 
+glitched = False
+
+
 def fake_screencap():
-    global manual_wait
+    global manual_wait, glitched
+    G = int(os.environ.get("GLITCH", "0"))
+    if G and not glitched and 0 < len(bars) - len(gone) - len(moving) <= G:
+        glitched = True                 # 残りわずかの所で1回だけ盤面が読めない画面（アニメ・暗転など）
+        img = src.copy()
+        img[345:2000] = bg
+        return img
     for i in list(moving):
         moving[i] -= 1
         if moving[i] <= 0:
@@ -155,6 +165,9 @@ backs_total = 0
 def fake_adb(*a, **k):
     global backs_total, misses
     cmd = a[-1]
+    if "dumpsys power" in cmd:
+        off_after = int(os.environ.get("SCREENOFF", "0"))
+        return "  mWakefulness=Asleep" if off_after and taps >= off_after else "  mWakefulness=Awake"
     if "dumpsys" in cmd and GREPFAIL:
         # 実機：grep が何も見つけないと終了コード1 → adb がエラーとして返す
         if not cmd.rstrip().endswith("true"):

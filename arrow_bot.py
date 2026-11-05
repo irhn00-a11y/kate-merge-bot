@@ -437,16 +437,49 @@ def wait_gone(board, ids, present, timeout):
             cells.add((c, r))
             c, r = c + dc, r + dr
     pts = [tuple(int(round(v)) for v in P(*u)) for u in cells - keep]
+    # まだ残っている棒のマス（見本）。これが写っていない画面（暗転・一瞬の乱れ）では「消えた」と判断しない
+    ref = [tuple(int(round(v)) for v in P(*u)) for j in sorted(present) for u in bars[j]["path"][:2]][:30]
     t0 = time.time()
     while True:
         B = line_mask(kb.screencap())
         H, W = B.shape
-        if not any(B[max(0, y - 3):y + 4, max(0, x - 3):x + 4].mean() > 0.5
-                   for x, y in pts if 0 <= x < W and 0 <= y < H):
+
+        def dark(x, y):
+            return 0 <= x < W and 0 <= y < H and B[max(0, y - 3):y + 4, max(0, x - 3):x + 4].mean() > 0.5
+        board_ok = not ref or sum(dark(x, y) for x, y in ref) >= 0.8 * len(ref)
+        if board_ok and not any(dark(x, y) for x, y in pts):
             return True
         if time.time() - t0 > timeout:
             return False
         time.sleep(0.05)
+
+
+_last_screen = [0.0, True]
+
+
+def screen_on(every=1.0):
+    """画面が点いているか（1秒に1回だけ実際に調べる）。調べられなければ点いている扱い"""
+    now = time.time()
+    if now - _last_screen[0] < every:
+        return _last_screen[1]
+    _last_screen[0] = now
+    try:
+        out = kb.adb("shell", "dumpsys power | grep -E 'mWakefulness=|Display Power: state='; true", timeout=6)
+    except kb.AdbError:
+        raise
+    except Exception:
+        return True
+    off = ("Asleep" in out or "Dozing" in out or "state=OFF" in out)
+    _last_screen[1] = not off
+    return not off
+
+
+def red_pixels(img):
+    """盤面範囲の赤い画素数（ミスした棒はゲームが赤くする）"""
+    H = img.shape[0]
+    s = H / REF_H
+    band = img[int(SEARCH_Y[0] * s):int(SEARCH_Y[1] * s)].astype(np.int16)
+    return int(((band[..., 2] > 170) & (band[..., 2] - band[..., 1] > 70) & (band[..., 2] - band[..., 0] > 70)).sum())
 
 
 def save(path, img):
@@ -485,10 +518,17 @@ def run(args):
     finish_at = None     # 指定面数をクリアした時刻。広告が出たら閉じてから止める
     last_ad = 0          # 最後に広告を見た時刻（ストア等を広告の飛び先とみなす判定用）
     weird = set()        # 直前の読み取りで不良だったマス（後で読めるようになった棒を許す）
+    hold_grid = None     # その面のグリッド。面の途中で読み直す時も使い回す（棒が減ると推定がずれるため）
+    hold_bad = 0         # hold_grid で読めない回数（別の面になった可能性）
+    reds = None          # 赤い画素数（増えたら＝ミス。スクショを残す）
+    last_plan_img = None
     game_ref = None      # ゲーム画面のスクショ（通話の吹き出し等のオーバーレイを広告ボタンと区別する）
     while True:
         if os.path.exists(stop_file):
             print("停止ファイルを検出")
+            break
+        if not args.keep_on_screen_off and not screen_on():
+            print("画面オフ → 停止")
             break
         try:
             if state == "seek" and game and not args.no_ad:
@@ -556,7 +596,18 @@ def run(args):
             print(f"広告処理でエラー（{e}）→ 広告処理を切って解くのは続ける")
             args.no_ad = True
         img = kb.screencap()
-        board, waves, stuck, err = analyze(img, grid if state == "play" else None)
+        board, waves, stuck, err = analyze(img, grid if state == "play" else hold_grid)
+        if state == "play" and not err:
+            rp = red_pixels(img)
+            if reds is not None and rp > reds + 200:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                d = os.path.expanduser(args.ad_dir).replace("arrow_ads", "arrow_miss")
+                os.makedirs(d, exist_ok=True)
+                cv2.imwrite(os.path.join(d, f"{ts}_screen.png"), img)
+                if last_plan_img is not None:
+                    cv2.imwrite(os.path.join(d, f"{ts}_plan.png"), last_plan_img)
+                print(f"!! ミスを検出（赤い棒が増えた）→ {d}/{ts}_*.png に保存")
+            reds = rp
         has = not err and (board["bars"] or board["problems"])
 
         if state == "play":
@@ -565,6 +616,8 @@ def run(args):
                 print(f"== クリア（{levels + 1}面目 / {time.time() - t_level:.1f}秒） ==" if not alive
                       else "== 盤面が消えた（途中）→ 新しい面を待つ ==")
                 levels += 1 if not alive else 0
+                if not alive:
+                    hold_grid = None
                 state, grid, need_gap = "seek", None, False
                 if args.levels and levels >= args.levels:
                     if not game:
@@ -583,11 +636,18 @@ def run(args):
                             break
                         finish_at = time.time()
                     need_gap = True
+                    hold_grid = None
                 state, grid, last_seen = "seek", None, None
                 time.sleep(args.poll)
                 continue
         else:  # seek
             ok = has and waves and (not stuck or board["problems"])
+            if hold_grid is not None and (not ok or len(board["problems"]) > max(3, len(board["bars"]))):
+                hold_bad += 1
+                if hold_bad >= 3:       # 使い回しのグリッドで読めない＝別の面になった → 推定し直す
+                    print("前のグリッドが合わない → 推定し直す")
+                    hold_grid, hold_bad = None, 0
+                    continue
             if not ok:
                 if has and board["problems"]:
                     bad += 1
@@ -628,7 +688,10 @@ def run(args):
                 time.sleep(0.3)
                 continue
             waiting = bad = 0
+            if hold_grid is None:
+                reds = None
             state, grid, alive, t_level = "play", board["grid"], _paths(board), time.time()
+            hold_grid, hold_bad = board["grid"], 0
             if game is None and not args.no_ad:
                 game = top_activity()
                 print(f"ゲーム画面: {game}")
@@ -668,7 +731,12 @@ def run(args):
             break
         print(f"棒{len(board['bars'])}本 → {sum(map(len, plan))}手実行")
         tapped, untapped = set(), set(range(len(board["bars"])))
+        last_plan_img = annotate(img, board, waves, stuck)
+        off = False
         for wi, w in enumerate(plan):
+            if not args.keep_on_screen_off and not screen_on():
+                off = True
+                break
             # この波の棒を塞いでいた棒が、実際に画面から消えたのを確かめてから押す（アニメ中に押すとミスになる）
             need = set().union(*(board["blockers"][i] for i in w)) & tapped
             if need and not wait_gone(board, need, untapped - tapped, args.gone_timeout):
@@ -680,6 +748,9 @@ def run(args):
             taps += len(w)
             tapped |= set(w)
         alive = _paths(board) - {tuple(board["bars"][i]["path"]) for i in tapped}
+        if off:
+            print("画面オフ → 停止")
+            break
         wait_gone(board, tapped, untapped - tapped, args.gone_timeout)   # 抜けきってから読み直す
     print(f"合計 {taps}タップ / {levels}面")
 
@@ -694,6 +765,7 @@ def main():
     ap.add_argument("--gone-timeout", type=float, default=4.0, help="前の棒が消えるのを待つ上限（秒）")
     ap.add_argument("--wave-wait", type=float, default=WAVE_WAIT, help="波と波の間の待ち（秒）")
     ap.add_argument("--top", action="store_true", help="前面の画面名が取れるか確認（ゲームを開いて3秒後に実行される）")
+    ap.add_argument("--keep-on-screen-off", action="store_true", help="画面オフでも止めない")
     ap.add_argument("--no-ad", action="store_true", help="広告処理をしない")
     ap.add_argument("--ad-back", type=float, default=2.0, help="広告中に閉じる操作をする間隔（秒）")
     ap.add_argument("--away-stop", type=float, default=600, help="別アプリを開いたままこの秒数たったら停止")
