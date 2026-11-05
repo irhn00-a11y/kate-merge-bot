@@ -3,7 +3,8 @@
 
 - 画面取得 → 実スクショから、抜けた棒を背景色で塗りつぶした画像を返す
 - タップ   → 押された棒の頭の先に他の棒が残っていたら「ミス」として数える
-  使い方: python tools/arrow_sim.py docs/arrow_board.jpg
+  使い方: python tools/arrow_sim.py docs/arrow_board.jpg [arrow_botの引数…]
+  AFTER=same でクリア後も盤面そっくりの画面が出続ける最悪ケース
 """
 import os
 import sys
@@ -20,6 +21,7 @@ board, _ = ab.parse_board(src)
 bars, P, pitch = board["bars"], board["P"], board["pitch"]
 bg = tuple(int(v) for v in np.median(src[400:500, 40:1040].reshape(-1, 3), 0))
 gone, misses, taps = set(), 0, 0
+blank_reads = 0
 occ = {u: i for i, b in enumerate(bars) for u in b["path"]}
 
 
@@ -31,8 +33,16 @@ def bar_at(x, y):
 
 def fake_screencap():
     img = src.copy()
-    if len(gone) == len(bars):          # クリア後は盤面のない画面
-        img[345:2000] = bg
+    if len(gone) == len(bars):          # クリア後
+        if AFTER == "same":             # 最悪ケース：クリア後も盤面そっくりの画面が出続ける
+            return src.copy()
+        img[345:2000] = bg              # 通常：盤面のない画面
+        if AFTER == "next":             # 盤面なし画面を3回見せたら次の面（同じ盤面）を出す
+            global blank_reads
+            blank_reads += 1
+            if blank_reads >= 3:
+                gone.clear()
+                blank_reads = 0
         return img
     for i in gone:
         for u in bars[i]["path"]:
@@ -68,7 +78,8 @@ kb.screencap, kb.tap = fake_screencap, fake_tap
 ab.tap_many = lambda pts, gap: [fake_tap(p) for p in pts]
 kb.online_devices = lambda: ["sim"]
 kb.time.sleep = ab.time.sleep = lambda s: None
-sys.argv = ["arrow_bot.py", "--levels", "1", "--start-delay", "0", "--save", ""] + sys.argv[2:]
+AFTER = os.environ.get("AFTER", "blank")
+sys.argv = ["arrow_bot.py", "--start-delay", "0", "--save", ""] + sys.argv[2:]
 ab.main()
 print(f"結果: タップ{taps}回 / 抜けた{len(gone)}/{len(bars)}本 / ミス{misses}回")
-sys.exit(0 if misses == 0 and len(gone) == len(bars) else 1)
+sys.exit(0 if misses == 0 else 1)

@@ -259,7 +259,15 @@ def save(path, img):
         cv2.imwrite(path, img)
 
 
+def _paths(board):
+    return {tuple(b["path"]) for b in board["bars"]}
+
+
 def run(args):
+    """状態:
+    seek … 新しい面を待つ。「読み取り不良0・全部解ける・2回続けて同じ盤面」を満たしたら開始
+    play … その面を解く。読み直した盤面は「さっき残っていた棒の部分集合」でなければ異常とみなして押さない
+    面クリア後は、一度盤面が消える（またはクリア画面になる）のを確認してから次の面を待つ"""
     if not kb.online_devices() and not kb.auto_connect():
         print("adbにつながらない（ワイヤレスデバッグONを確認）")
         return
@@ -271,57 +279,86 @@ def run(args):
     if os.path.exists(stop_file):
         os.remove(stop_file)
     print(f"開始。止めるには Ctrl+C か `touch {args.stop_file}`")
-    levels = taps = 0
-    waiting = bad = 0
-    had_board = False
-    grid = None          # 面の最初に読んだグリッドを、その面の間は使い回す
+    levels = taps = waiting = bad = 0
+    state, grid, alive, last_seen = "seek", None, set(), None
+    need_gap = False     # クリア直後：盤面が一度消えるまで新しい面とみなさない
+    t_level = None
     while True:
         if os.path.exists(stop_file):
             print("停止ファイルを検出")
             break
         img = kb.screencap()
-        board, waves, stuck, err = analyze(img, grid)
-        if err or not board["bars"]:
-            grid = None
-            if had_board:
-                levels += 1
-                had_board = False
-                print(f"== 盤面が消えた → クリアとみなす（{levels}面目） ==")
+        board, waves, stuck, err = analyze(img, grid if state == "play" else None)
+        has = not err and board["bars"]
+
+        if state == "play":
+            if not has or not _paths(board):
+                # 残りを全部押した後に盤面が消えた → クリア
+                print(f"== クリア（{levels + 1}面目 / {time.time() - t_level:.1f}秒） ==" if not alive
+                      else "== 盤面が消えた（途中）→ 新しい面を待つ ==")
+                levels += 1 if not alive else 0
+                state, grid, need_gap = "seek", None, False
                 if args.levels and levels >= args.levels:
                     break
-            waiting += 1
-            if waiting == 1:
-                print(f"盤面待ち（{err or '棒なし'}）。次の面を開いて")
-            if waiting * args.poll > args.idle_stop:
-                print(f"{args.idle_stop}秒盤面が出ないので停止")
-                break
-            time.sleep(args.poll)
-            continue
-        waiting = 0
-        save(args.save, annotate(img, board, waves, stuck))
-        if board["problems"]:
-            # 読み違いのまま押すとミス扱いになりうるので、怪しい時は押さない
-            bad += 1
+                continue
+            if not _paths(board) <= alive or board["problems"]:
+                # 想定外の棒が増えた＝クリア画面や次の面、または読み違い → 押さない
+                print("盤面が想定と違う → 押さずに様子見")
+                if not alive:
+                    levels += 1
+                    print(f"== クリア（{levels}面目 / {time.time() - t_level:.1f}秒） ==")
+                    if args.levels and levels >= args.levels:
+                        break
+                    need_gap = True
+                state, grid, last_seen = "seek", None, None
+                time.sleep(args.poll)
+                continue
+        else:  # seek
+            ok = has and not board["problems"] and not stuck and waves
+            if not ok:
+                if has and board["problems"]:
+                    bad += 1
+                    save(args.save, annotate(img, board, waves, stuck))
+                    report(board, waves, stuck)
+                    print(f"読み取り不良あり → タップしない（{bad}回目）。画像: {args.save}")
+                    if bad >= args.max_bad:
+                        print(f"{args.max_bad}回続けて読めないので停止")
+                        break
+                if not has:
+                    need_gap = False
+                waiting += 1
+                if waiting == 1:
+                    print(f"盤面待ち（{err or '解ける盤面なし'}）。次の面を開いて")
+                if waiting * args.poll > args.idle_stop:
+                    print(f"{args.idle_stop}秒盤面が出ないので停止")
+                    break
+                last_seen = None
+                time.sleep(args.poll)
+                continue
+            if need_gap:
+                waiting += 1
+                if waiting == 1:
+                    print("クリア後の画面待ち（盤面が一度消えるまで押さない）")
+                if waiting * args.poll > args.idle_stop:
+                    print(f"{args.idle_stop}秒たっても画面が変わらないので停止")
+                    break
+                time.sleep(args.poll)
+                continue
+            if _paths(board) != last_seen:      # アニメ中の誤読を避けるため2回同じなら開始
+                last_seen = _paths(board)
+                time.sleep(0.3)
+                continue
+            waiting = bad = 0
+            state, grid, alive, t_level = "play", board["grid"], _paths(board), time.time()
             report(board, waves, stuck)
-            print(f"読み取り不良あり → タップしない（{bad}回目）。画像: {args.save}")
-            if bad >= args.max_bad:
-                print(f"{args.max_bad}回続けて読めないので停止")
-                break
-            grid = None      # グリッドから読み直してみる
-            time.sleep(2)
-            continue
-        bad = 0
-        grid = board["grid"]
+
+        save(args.save, annotate(img, board, waves, stuck))
         if not waves:
             report(board, waves, stuck)
             print("抜ける棒がない（読み違いか、ルール解釈違い）→ 停止")
             break
-        had_board = True
-        plan = waves[:1] if args.step else waves
-        if args.step:
-            plan = [plan[0][:1]]
+        plan = [waves[0][:1]] if args.step else waves
         if args.dry_run:
-            report(board, waves, stuck)
             print(f"dry-run: 解答画像を保存 → {args.save}")
             break
         print(f"棒{len(board['bars'])}本 → {sum(map(len, plan))}手実行")
@@ -330,6 +367,7 @@ def run(args):
             taps += len(w)
             if wi < len(plan) - 1:
                 time.sleep(args.wave_wait)
+        alive = _paths(board) - {tuple(board["bars"][i]["path"]) for w in plan for i in w}
         time.sleep(args.wave_wait)   # 抜けきってから読み直す（残っていれば続きを解く）
     print(f"合計 {taps}タップ / {levels}面")
 
@@ -339,7 +377,7 @@ def main():
     ap.add_argument("--analyze", metavar="IMAGE", help="画像を解いて arrow_solution.png を出力")
     ap.add_argument("--dry-run", action="store_true", help="実機を読んで解答画像を保存するだけ")
     ap.add_argument("--step", action="store_true", help="1タップごとに読み直す（慎重モード）")
-    ap.add_argument("--levels", type=int, default=0, help="この面数クリアしたら停止（0=無制限）")
+    ap.add_argument("--levels", type=int, default=1, help="この面数クリアしたら停止（0=無制限。次の面は自分で開く）")
     ap.add_argument("--tap-wait", type=float, default=TAP_WAIT, help="同じ波の中のタップ間隔（秒）")
     ap.add_argument("--wave-wait", type=float, default=WAVE_WAIT, help="波と波の間の待ち（秒）")
     ap.add_argument("--max-bad", type=int, default=5, help="読み取り不良がこの回数続いたら停止")
