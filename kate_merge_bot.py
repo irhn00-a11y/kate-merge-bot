@@ -50,10 +50,87 @@ EMPTY, BOX, JAR, ITEM = "empty", "box", "jar", "item"
 SERIAL = None   # --serial で指定（Termux自己接続なら 127.0.0.1:ポート）
 
 
-def adb(*args, binary=False):
+class AdbError(RuntimeError):
+    """adbが切れている・応答しない（コードのバグではなく接続の問題）"""
+
+
+def adb(*args, binary=False, timeout=20):
     cmd = ["adb"] + (["-s", SERIAL] if SERIAL else []) + list(args)
-    out = subprocess.run(cmd, capture_output=True, check=True)
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True, timeout=timeout)
+    except subprocess.CalledProcessError as e:
+        raise AdbError((e.stderr or b"").decode(errors="ignore").strip() or f"exit {e.returncode}")
+    except subprocess.TimeoutExpired:
+        raise AdbError("応答なし（タイムアウト）")
     return out.stdout if binary else out.stdout.decode(errors="ignore")
+
+
+def adb_plain(*args):
+    """-s を付けずに実行（接続管理用）。失敗しても例外にしない"""
+    r = subprocess.run(["adb", *args], capture_output=True, timeout=15)
+    return (r.stdout + r.stderr).decode(errors="ignore")
+
+
+def online_devices():
+    lines = adb_plain("devices").splitlines()[1:]
+    return [l.split()[0] for l in lines if l.strip().endswith("device")]
+
+
+def local_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))   # 実際には送信しない。自分のWi-FiのIPを知るだけ
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def scan_open_ports(host="127.0.0.1", lo=30000, hi=50000):
+    """ワイヤレスデバッグの接続ポート候補（このスマホ上で開いているポート）を探す"""
+    import socket
+    found = []
+    for port in range(lo, hi):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.02)
+        try:
+            if s.connect_ex((host, port)) == 0:
+                found.append(port)
+        finally:
+            s.close()
+    return found
+
+
+def auto_connect(verbose=True):
+    """切断時の自動再接続。ポートが変わっていても総当たりで見つける（ワイヤレスデバッグONが前提）"""
+    global SERIAL
+    adb_plain("reconnect", "offline")
+    devs = online_devices()
+    if devs:
+        SERIAL = devs[0]
+        return True
+    if verbose:
+        print("ワイヤレスデバッグのポートを探索中…（数秒）")
+    ports = scan_open_ports()
+    ip = local_ip()
+    for port in ports:
+        for host in ("127.0.0.1", ip):
+            if not host:
+                continue
+            msg = adb_plain("connect", f"{host}:{port}")
+            if "connected" in msg and "fail" not in msg:
+                time.sleep(0.5)
+                devs = online_devices()
+                if devs:
+                    SERIAL = devs[0]
+                    if verbose:
+                        print(f"再接続OK: {SERIAL}")
+                    return True
+    if verbose:
+        print("再接続できず。設定でワイヤレスデバッグがONか確認して（Wi-Fiが切れるとOFFになる）")
+    return False
 
 
 _RAW_OK = True
@@ -63,8 +140,8 @@ def screencap():
     """非圧縮のraw形式で取得（PNG圧縮を省くので速い）。失敗したらPNGに切替"""
     global _RAW_OK
     if _RAW_OK:
+        raw = adb("exec-out", "screencap", binary=True)   # 接続エラーはそのまま上に投げる
         try:
-            raw = adb("exec-out", "screencap", binary=True)
             w, h = np.frombuffer(raw[:8], "<u4")
             hdr = len(raw) - int(w) * int(h) * 4
             if hdr in (12, 16):
@@ -396,6 +473,26 @@ def settle_count(empties, timeout=PRODUCE_TIMEOUT):
 
 
 def run(args):
+    """接続が切れたら自動で再接続して続きから再開する"""
+    global SERIAL
+    devs = online_devices()
+    if not devs and not auto_connect():
+        return
+    if devs and not SERIAL:
+        SERIAL = devs[0]
+    for _ in range(args.max_reconnect + 1):
+        try:
+            return _run(args)
+        except AdbError as e:
+            print(f"\nadbが切れた（{e}）→ 再接続を試す")
+            time.sleep(2)
+            if not auto_connect():
+                return
+            args.start_delay = 0
+    print("再接続の上限に達したので停止")
+
+
+def _run(args):
     stop_file = os.path.expanduser(args.stop_file)
     if os.path.exists(stop_file):
         os.remove(stop_file)
@@ -545,6 +642,8 @@ def main():
     ap.add_argument("--swipe-ms", type=int, default=SWIPE_MS, help="ドラッグ時間ms")
     ap.add_argument("--wait", type=float, default=WAIT_AFTER_MERGE, help="1手ごとの待ち秒")
     ap.add_argument("-v", "--verbose", action="store_true", help="取得・解析の所要時間を表示")
+    ap.add_argument("--connect", action="store_true", help="adb接続だけ行う（再起動後のポート探しに便利）")
+    ap.add_argument("--max-reconnect", type=int, default=5, help="実行中の自動再接続の上限回数")
     ap.add_argument("--ignore-orders", action="store_true", help="注文の品も保護せずマージする")
     ap.add_argument("--max-merges", type=int, default=0, help="この回数マージしたら停止（0=無制限）")
     args = ap.parse_args()
@@ -552,6 +651,10 @@ def main():
     if is_termux():
         args.no_view = True
 
+    if args.connect:
+        ok = auto_connect()
+        print("接続中:", online_devices() if ok else "なし")
+        return
     if args.analyze:
         img = cv2.imread(args.analyze)
         print("board_visible:", board_visible(img))
