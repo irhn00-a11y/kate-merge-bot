@@ -36,6 +36,7 @@ ORDER_THRESHOLD = 0.60    # 注文アイコンとのテンプレ一致度がこ�
 ORDER_MARGIN = 0.12       # …その注文の最高一致から この差以内なら保護（マージしない）
 ORDER_BAND = (380, 720)   # 注文パネルを探す縦範囲（1080x2340基準）
 ORDER_MIN_X = 230         # これより左はスパナボタン等なので除外
+DELIVER_BAND = (280, 500) # 納品✓ボタンを探す縦範囲
 SWIPE_MS = 150            # ドラッグ時間
 WAIT_AFTER_MERGE = 0.35   # 1手ごとの待ち
 BATCH = 8                 # 1回の盤面読み取りで実行する最大手数（重ならないペアをまとめて実行）
@@ -203,16 +204,47 @@ def classify(cell):
     teal = ((inner[..., 0] >= 70) & (inner[..., 0] <= 88) & (inner[..., 1] < 120)).mean()
     # 段ボール（茶色 H≈10-22, S中〜高）
     brown = ((H >= 8) & (H <= 22) & (S > 90) & (V > 120)).mean()
-    # 瓶の青いフタ（上部20%に H≈95-110 の高彩度）
-    top = hsv[:int(h * .25), int(w * .2):int(w * .8)]
-    lid = ((top[..., 0] >= 92) & (top[..., 0] <= 112) & (top[..., 1] > 120)).mean()
+    # 瓶の青いフタ：上部の水平な帯が一面に青い（稲妻アイテムは斜めなので帯が埋まらない）
+    def blue(y0, y1, x0, x1):
+        t = hsv[int(h * y0):int(h * y1), int(w * x0):int(w * x1)]
+        return ((t[..., 0] >= 92) & (t[..., 0] <= 112) & (t[..., 1] > 120)).mean()
     if teal > 0.82:
         return EMPTY
     if brown > 0.45:
         return BOX
-    if lid > 0.18:
+    if blue(.04, .16, .3, .7) >= 0.9 and blue(.04, .16, .2, .4) >= 0.5:
         return JAR
     return ITEM
+
+
+def is_ready(cell):
+    """注文に使える品は背景が黄緑になる（ゲーム側の表示）→ 納品待ちとして触らない"""
+    hsv = cv2.cvtColor(cell, cv2.COLOR_BGR2HSV)
+    h, w = hsv.shape[:2]
+    ring = np.concatenate([hsv[:int(h * .1)].reshape(-1, 3), hsv[-int(h * .1):].reshape(-1, 3),
+                           hsv[:, :int(w * .1)].reshape(-1, 3), hsv[:, -int(w * .1):].reshape(-1, 3)])
+    g = (ring[:, 0] >= 35) & (ring[:, 0] <= 55) & (ring[:, 1] > 150) & (ring[:, 2] > 150)
+    return g.mean() > 0.4
+
+
+def find_deliver_buttons(img):
+    """客の顔の上に出る黄緑の✓ボタン（納品可能）を探す → 中心座標のリスト"""
+    h, w = img.shape[:2]
+    sx, sy = w / REF_W, h / REF_H
+    y0, y1 = int(DELIVER_BAND[0] * sy), int(DELIVER_BAND[1] * sy)
+    hsv = cv2.cvtColor(img[y0:y1], cv2.COLOR_BGR2HSV)
+    green = ((hsv[..., 0] >= 35) & (hsv[..., 0] <= 60) & (hsv[..., 1] > 150) & (hsv[..., 2] > 170)).astype(np.uint8)
+    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(green)
+    out = []
+    for x, y, bw, bh, a in st[1:]:
+        if not (50 * sx < bw < 110 * sx and 50 * sy < bh < 110 * sy) or a < 1500 * sx * sy:
+            continue
+        roi = hsv[y:y + bh, x:x + bw]
+        white = ((roi[..., 1] < 50) & (roi[..., 2] > 220)).mean()   # 中の白いチェックマーク
+        if white > 0.05:
+            out.append((int(x + bw / 2), int(y0 + y + bh / 2)))
+    return out
 
 
 def feature(cell):
@@ -310,9 +342,10 @@ def analyze(img, protect_orders=True, producers=()):
     for c, r, cell, center in cells(img):
         kind = classify(cell)
         gen = (c, r) in producers
-        grid[(c, r)] = dict(kind=kind, center=center, protected=gen, producer=gen,
+        ready = kind == ITEM and not gen and is_ready(cell)
+        grid[(c, r)] = dict(kind=kind, center=center, protected=gen or ready, producer=gen, ready=ready,
                             feat=feature(cell) if kind == ITEM else None)
-        if kind == ITEM and not gen:
+        if kind == ITEM and not gen and not ready:
             cellimgs[(c, r)] = cell
     # 注文ごとに盤面アイテムを採点 → 最高一致の近くにいる物だけ保護
     small = {p: cv2.resize(cl, None, fx=MATCH_SCALE, fy=MATCH_SCALE, interpolation=cv2.INTER_AREA)
@@ -521,6 +554,10 @@ def settle_count(empties, timeout=PRODUCE_TIMEOUT):
     return max(last, 0)
 
 
+def _bkey(b):
+    return (b[0] // 40, b[1] // 40)
+
+
 def run(args):
     """接続が切れたら自動で再接続して続きから再開する"""
     global SERIAL
@@ -558,6 +595,8 @@ def _run(args):
     last_prot = None
     producers = parse_cells(args.produce) if args.produce else []
     cooldown, fails = {}, {}
+    delivered = 0
+    deliver_try, deliver_skip = {}, {}
     cur = None            # いま使っている生産機（選択済みなら1タップ=1個なので使い続ける）
     phase = "merge"       # merge: ペアが尽きるまでマージ / produce: 空きが埋まるまで生産
     if producers:
@@ -575,6 +614,26 @@ def _run(args):
                 ST.final("盤面が戻らないので停止"); break
             time.sleep(2); continue
         hidden = 0
+        # ---- 納品：✓ボタンがあれば押す（同じ所を押しても消えなければ一旦あきらめる） ----
+        if not args.no_deliver:
+            btns = [b for b in find_deliver_buttons(img) if deliver_skip.get(_bkey(b), 0) <= time.time()]
+            if btns:
+                for b in btns:
+                    k = _bkey(b)
+                    deliver_try[k] = deliver_try.get(k, 0) + 1
+                    if deliver_try[k] > 3:
+                        deliver_skip[k] = time.time() + 30
+                        deliver_try[k] = 0
+                        print(f"✓ボタン {b} を押しても消えない → 30秒スキップ")
+                        continue
+                    print(f"納品！ ✓ボタン {b} をタップ")
+                    ST.update(f"納品中（✓タップ{delivered + 1}回目）", force=True)
+                    if not args.dry_run:
+                        tap(b)
+                    delivered += 1
+                    time.sleep(args.deliver_wait)
+                continue
+            deliver_try.clear()
         t_an = time.time()
         grid, groups = analyze(img, protect_orders=not args.ignore_orders, producers=producers)
         moves = plan_merges(groups)
@@ -631,7 +690,7 @@ def _run(args):
                 if got == 0:
                     # 誤判定もあり得るので休憩は短く始めて連続失敗で伸ばす
                     fails[cur] = fails.get(cur, 0) + 1
-                    rest = min(args.cooldown, 15 * 2 ** (fails[cur] - 1))
+                    rest = min(args.cooldown, args.first_rest * 2 ** (fails[cur] - 1))
                     cooldown[cur] = time.time() + rest
                     print(f"  {cur} 反応なし → {rest}秒休ませる（連続{fails[cur]}回）")
                     if args.save:
@@ -640,7 +699,7 @@ def _run(args):
                 else:
                     fails[cur] = 0
                     idle = 0
-                    if got < n - 1:   # 1回分は「選択タップ」の可能性があるので許容
+                    if got < n // 2:   # 取りこぼしや選択タップは許容し、半分も出ない時だけ在庫切れ扱い
                         cooldown[cur] = time.time() + args.depleted_rest
                         print(f"  {cur} は在庫切れっぽい → {args.depleted_rest}秒休ませて次へ")
                         cur = None
@@ -671,8 +730,8 @@ def _run(args):
                 time.sleep(args.wait)
         if args.dry_run:
             time.sleep(1.5)
-    print(f"合計 {merges} 回マージ / {produced} 個生産")
-    ST.done(f"{merges}回マージ / {produced}個生産")
+    print(f"合計 {merges} 回マージ / {produced} 個生産 / ✓タップ {delivered} 回")
+    ST.done(f"{merges}回マージ / {produced}個生産 / ✓{delivered}回")
 
 
 def main():
@@ -685,9 +744,12 @@ def main():
                     help="生産機のマス（0始まり、複数可 例: --produce 5,3 1,3）。順番にタップ")
     ap.add_argument("--max-produce", type=int, default=0, help="生産する個数の上限（0=無制限。エネルギー節約用）")
     ap.add_argument("--burst", type=int, default=6, help="生産フェーズで1回に連打する回数")
-    ap.add_argument("--tap-interval", type=float, default=0.25, help="連打の間隔秒")
+    ap.add_argument("--tap-interval", type=float, default=0.45, help="連打の間隔秒（速すぎると取りこぼす）")
+    ap.add_argument("--first-rest", type=float, default=2, help="反応なし生産機の最初の休憩秒（連続失敗で倍々）")
+    ap.add_argument("--no-deliver", action="store_true", help="✓ボタンの自動納品をしない")
+    ap.add_argument("--deliver-wait", type=float, default=1.5, help="納品タップ後の待ち秒")
     ap.add_argument("--keep-empty", type=int, default=0, help="生産で埋めずに残す空きマス数")
-    ap.add_argument("--depleted-rest", type=int, default=30, help="在庫切れっぽい生産機を休ませる秒数")
+    ap.add_argument("--depleted-rest", type=int, default=5, help="在庫切れっぽい生産機を休ませる秒数")
     ap.add_argument("--max-idle", type=int, default=20, help="全生産機休憩中の待機を何回で諦めるか")
     ap.add_argument("--cooldown", type=int, default=60, help="何も出なかった生産機を休ませる秒数")
     ap.add_argument("--serial", help="adb接続先（例 127.0.0.1:37123）。1台だけなら省略可")
