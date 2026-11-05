@@ -243,6 +243,73 @@ def report(board, waves, stuck):
         print("  不良:", why, sorted(comp)[:3], "…")
 
 
+
+# ---------------- 広告 ----------------
+# 前面のActivity名で判定する（画像認識より確実）。ゲーム画面と違う Activity が前に出ていたら広告とみなす
+AD_HINTS = ("adactivity", "applovin", "unity3d", "ironsource", "vungle", "liftoff", "mbridge",
+            "mintegral", "chartboost", "fyber", "inneractive", "inmobi", "bytedance", "pangle",
+            "facebook.ads", "audiencenetwork", "moloco", "bigo", "yandex.mobile.ads", "adcolony",
+            "tapjoy", "digitalturbine", "smaato", "startapp", "appodeal", "admob", "interstitial",
+            "fullscreen", ".ads.", "ads.", "rewarded")
+# 広告から飛ばされがちな先（ストア・ブラウザ）：戻るで帰ってよい
+OUTSIDE_OK = ("com.android.vending", "com.android.chrome", "com.sec.android.app.sbrowser",
+              "org.mozilla", "com.google.android.googlequicksearchbox")
+# ユーザー自身の操作（Termuxやホームに戻った等）：何もしない
+HANDS_OFF = ("com.termux", "launcher", "com.android.systemui", "com.android.settings",
+             "incallui", "dialer", "telecom", "com.android.phone")
+
+
+def top_activity():
+    """前面のActivity。'パッケージ/クラス' の文字列。取れなければ None"""
+    import re
+    for cmd in ("dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'",
+                "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'"):
+        try:
+            out = kb.adb("shell", cmd, timeout=8)
+        except kb.AdbError:
+            raise
+        except Exception:
+            continue
+        m = re.search(r"u\d+ ([\w.]+)/([\w.$]+)", out)
+        if m:
+            pkg, cls = m.groups()
+            return f"{pkg}/{pkg + cls if cls.startswith('.') else cls}"
+    return None
+
+
+def ad_kind(comp, game):
+    """'game' / 'ad'(戻るで閉じる) / 'hands_off'(触らない) / 'unknown'(記録だけ)"""
+    if comp is None or comp == game:
+        return "game"
+    low = comp.lower()
+    if any(h in low for h in HANDS_OFF):
+        return "hands_off"
+    if any(h in low for h in AD_HINTS) or low.startswith(OUTSIDE_OK):
+        return "ad"
+    if game and comp.split("/")[0] != game.split("/")[0]:
+        return "ad"          # 別アプリに飛ばされた（広告のリンク先など）→ 戻るで帰る
+    return "unknown"         # ゲーム内の別画面（クリア画面等かも）→ 記録だけして触らない
+
+
+def back():
+    kb.adb("shell", "input keyevent KEYCODE_BACK")
+
+
+def ad_sample(args, tag, comp):
+    """広告の調査用：スクショと記録を残す（広告いなしbotの下調べを兼ねる）"""
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    d = os.path.expanduser(args.ad_dir)
+    os.makedirs(d, exist_ok=True)
+    try:
+        cv2.imwrite(os.path.join(d, f"{ts}_{tag}.png"), kb.screencap())
+    except kb.AdbError:
+        raise
+    except Exception:
+        pass
+    with open(os.path.expanduser(args.ad_log), "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%F %T')},{tag},{comp}\n")
+
+
 # ---------------- 実機ループ ----------------
 def tap_many(points, gap):
     """1波ぶんのタップを1回の adb shell にまとめる（1タップごとのadb往復を省く）"""
@@ -283,10 +350,44 @@ def run(args):
     state, grid, alive, last_seen = "seek", None, set(), None
     need_gap = False     # クリア直後：盤面が一度消えるまで新しい面とみなさない
     t_level = None
+    game = None          # ゲーム画面の Activity（最初に盤面を解き始めた時に記録）
+    ad = None            # 表示中の広告 dict(comp, t0, backs, last_back, sampled)
+    finish_at = None     # 指定面数をクリアした時刻。広告が出たら閉じてから止める
     while True:
         if os.path.exists(stop_file):
             print("停止ファイルを検出")
             break
+        if state == "seek" and game and not args.no_ad:
+            comp = top_activity()
+            kind = ad_kind(comp, game)
+            if kind != "game":
+                now = time.time()
+                if ad is None or ad["comp"] != comp:
+                    ad = dict(comp=comp, t0=now, backs=0, last_back=0, sampled=False, kind=kind)
+                    print(f"広告/別画面: {comp}（{kind}）")
+                if not ad["sampled"] and now - ad["t0"] > 1.0:
+                    ad_sample(args, kind, comp)
+                    ad["sampled"] = True
+                if kind == "ad" and now - ad["last_back"] >= args.ad_back:
+                    back()
+                    ad["backs"] += 1
+                    ad["last_back"] = now
+                if now - ad["t0"] > args.ad_timeout:
+                    ad_sample(args, "timeout", comp)
+                    print(f"{args.ad_timeout:.0f}秒閉じられないので停止（スクショを {args.ad_dir} に保存）")
+                    break
+                waiting = 0
+                time.sleep(0.5)
+                continue
+            if ad:
+                print(f"広告を閉じた（{time.time() - ad['t0']:.1f}秒 / 戻る{ad['backs']}回）")
+                with open(os.path.expanduser(args.ad_log), "a", encoding="utf-8") as f:
+                    f.write(f"{time.strftime('%F %T')},closed,{ad['comp']},{time.time() - ad['t0']:.1f}s,back{ad['backs']}\n")
+                ad = None
+                if finish_at:
+                    break
+            if finish_at and time.time() - finish_at > args.ad_grace:
+                break        # 指定面数クリア後、広告が出なかった
         img = kb.screencap()
         board, waves, stuck, err = analyze(img, grid if state == "play" else None)
         has = not err and board["bars"]
@@ -299,7 +400,9 @@ def run(args):
                 levels += 1 if not alive else 0
                 state, grid, need_gap = "seek", None, False
                 if args.levels and levels >= args.levels:
-                    break
+                    if not game:
+                        break
+                    finish_at = time.time()
                 continue
             if not _paths(board) <= alive or board["problems"]:
                 # 想定外の棒が増えた＝クリア画面や次の面、または読み違い → 押さない
@@ -308,7 +411,9 @@ def run(args):
                     levels += 1
                     print(f"== クリア（{levels}面目 / {time.time() - t_level:.1f}秒） ==")
                     if args.levels and levels >= args.levels:
-                        break
+                        if not game:
+                            break
+                        finish_at = time.time()
                     need_gap = True
                 state, grid, last_seen = "seek", None, None
                 time.sleep(args.poll)
@@ -326,6 +431,9 @@ def run(args):
                         break
                 if not has:
                     need_gap = False
+                if finish_at:
+                    time.sleep(0.5)
+                    continue
                 waiting += 1
                 if waiting == 1:
                     print(f"盤面待ち（{err or '解ける盤面なし'}）。次の面を開いて")
@@ -335,7 +443,10 @@ def run(args):
                 last_seen = None
                 time.sleep(args.poll)
                 continue
-            if need_gap:
+            if need_gap or finish_at:
+                if finish_at:
+                    time.sleep(0.5)
+                    continue
                 waiting += 1
                 if waiting == 1:
                     print("クリア後の画面待ち（盤面が一度消えるまで押さない）")
@@ -350,6 +461,9 @@ def run(args):
                 continue
             waiting = bad = 0
             state, grid, alive, t_level = "play", board["grid"], _paths(board), time.time()
+            if game is None and not args.no_ad:
+                game = top_activity()
+                print(f"ゲーム画面: {game}")
             report(board, waves, stuck)
 
         save(args.save, annotate(img, board, waves, stuck))
@@ -380,6 +494,12 @@ def main():
     ap.add_argument("--levels", type=int, default=1, help="この面数クリアしたら停止（0=無制限。次の面は自分で開く）")
     ap.add_argument("--tap-wait", type=float, default=TAP_WAIT, help="同じ波の中のタップ間隔（秒）")
     ap.add_argument("--wave-wait", type=float, default=WAVE_WAIT, help="波と波の間の待ち（秒）")
+    ap.add_argument("--no-ad", action="store_true", help="広告処理をしない")
+    ap.add_argument("--ad-back", type=float, default=2.0, help="広告中に戻るを押す間隔（秒）")
+    ap.add_argument("--ad-timeout", type=float, default=90, help="広告がこの秒数閉じなければ停止")
+    ap.add_argument("--ad-grace", type=float, default=5, help="最終面クリア後、広告が出るのを待つ秒数")
+    ap.add_argument("--ad-dir", default="~/storage/shared/Pictures/arrow_ads" if kb.is_termux() else "arrow_ads", help="広告スクショの保存先")
+    ap.add_argument("--ad-log", default="~/arrow_ad_log.csv", help="広告の記録")
     ap.add_argument("--max-bad", type=int, default=5, help="読み取り不良がこの回数続いたら停止")
     ap.add_argument("--poll", type=float, default=1.0, help="盤面待ちの確認間隔（秒）")
     ap.add_argument("--idle-stop", type=float, default=120, help="盤面がこの秒数出なければ停止")

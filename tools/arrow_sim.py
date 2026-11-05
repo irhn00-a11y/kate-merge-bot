@@ -4,7 +4,8 @@
 - 画面取得 → 実スクショから、抜けた棒を背景色で塗りつぶした画像を返す
 - タップ   → 押された棒の頭の先に他の棒が残っていたら「ミス」として数える
   使い方: python tools/arrow_sim.py docs/arrow_board.jpg [arrow_botの引数…]
-  AFTER=same でクリア後も盤面そっくりの画面が出続ける最悪ケース
+  AFTER=same でクリア後も盤面そっくりの画面が出続ける最悪ケース、AFTER=next で次の面
+  AD=1 でクリア後に広告（戻る3回目で閉じる）、STORE=1 で1回目の戻るでストアに飛ばされる
 """
 import os
 import sys
@@ -31,8 +32,17 @@ def bar_at(x, y):
     return None if i is None or i in gone else i
 
 
+cleared = 0
+
+
+def levels_cleared():
+    return cleared + 1
+
+
 def fake_screencap():
     img = src.copy()
+    if len(gone) == len(bars) and AD and ad_state["shown"] < levels_cleared():
+        ad_state.update(on=True, backs=0, shown=ad_state["shown"] + 1)
     if len(gone) == len(bars):          # クリア後
         if AFTER == "same":             # 最悪ケース：クリア後も盤面そっくりの画面が出続ける
             return src.copy()
@@ -40,7 +50,9 @@ def fake_screencap():
         if AFTER == "next":             # 盤面なし画面を3回見せたら次の面（同じ盤面）を出す
             global blank_reads
             blank_reads += 1
-            if blank_reads >= 3:
+            if blank_reads >= 3 and not ad_state["on"]:
+                global cleared
+                cleared += 1
                 gone.clear()
                 blank_reads = 0
         return img
@@ -74,6 +86,44 @@ def fake_tap(p):
     gone.add(i)
 
 
+GAME = "com.example.arrows/com.unity3d.player.UnityPlayerActivity"
+ADC = "com.example.arrows/com.applovin.adview.AppLovinFullscreenActivity"
+AD = os.environ.get("AD", "")          # AD=1 でクリア後に広告。戻る2回まではカウントダウン中で無視
+STORE = os.environ.get("STORE", "")    # STORE=1 で広告の1回目の戻るがストアに飛ばされる
+ad_state = dict(on=False, backs=0, store=False, shown=0)
+backs_total = 0
+
+
+def fake_adb(*a, **k):
+    global backs_total
+    cmd = a[-1]
+    if "dumpsys" in cmd:
+        if ad_state["store"]:
+            return "topResumedActivity=ActivityRecord{1 u0 com.android.vending/.AssetBrowserActivity t9}"
+        comp = ADC if ad_state["on"] else GAME
+        pkg, cls = comp.split("/")
+        return f"  topResumedActivity=ActivityRecord{{1 u0 {pkg}/{cls} t5}}"
+    if "KEYCODE_BACK" in cmd:
+        backs_total += 1
+        if ad_state["store"]:
+            ad_state["store"] = False
+        elif ad_state["on"]:
+            ad_state["backs"] += 1
+            if STORE and ad_state["backs"] == 1:
+                ad_state["store"] = True
+            elif ad_state["backs"] >= 3:
+                ad_state["on"] = False
+        else:
+            print("  !! ゲーム画面で戻るを押した")
+            global misses
+            misses += 1
+        return ""
+    if "input tap" in cmd and ad_state["on"]:
+        print("  !! 広告中にタップした")
+    return ""
+
+
+kb.adb = fake_adb
 kb.screencap, kb.tap = fake_screencap, fake_tap
 ab.tap_many = lambda pts, gap: [fake_tap(p) for p in pts]
 kb.online_devices = lambda: ["sim"]
@@ -81,5 +131,5 @@ kb.time.sleep = ab.time.sleep = lambda s: None
 AFTER = os.environ.get("AFTER", "blank")
 sys.argv = ["arrow_bot.py", "--start-delay", "0", "--save", ""] + sys.argv[2:]
 ab.main()
-print(f"結果: タップ{taps}回 / 抜けた{len(gone)}/{len(bars)}本 / ミス{misses}回")
+print(f"結果: タップ{taps}回 / 抜けた{len(gone)}/{len(bars)}本 / ミス{misses}回 / 戻る{backs_total}回 / 広告{ad_state['shown']}回・残り表示中={ad_state['on']}")
 sys.exit(0 if misses == 0 else 1)
