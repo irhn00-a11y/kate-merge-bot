@@ -2,10 +2,10 @@
   "schema_version": 2,
   "repository": "kate-merge-bot",
   "central_repository": "irhn00-a11y/office",
-  "central_ref": "gipi/governance-bootstrap-20261113",
+  "central_ref": "main",
   "revision": 2,
-  "state": "review-only",
-  "dependency": "office PR #24 must be approved and merged before production rollout",
+  "state": "active",
+  "dependency": "office PR #24 merged; activation authorized by user",
   "runtime_commit": "8e5b4bbfd2c9c225ea293b09fe9030a88b3333fe",
   "runtime_sha256": "e519e2afaf70ac0f7bda5e6291e8a8cad01adac96f1b24d79f23cf11f576dad3"
 }
