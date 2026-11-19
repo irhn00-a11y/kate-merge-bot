@@ -5,7 +5,7 @@
 2. スマホ：設定 → 端末情報 → ビルド番号を7回タップ → 開発者オプション →「USBデバッグ」ON
    - **「USBデバッグ（セキュリティ設定）」もON**（Xiaomi/POCO系はこれが無いとタップ入力が拒否される）
 3. USB接続して `adb devices` で `device` と出ればOK（ワイヤレスデバッグでも可）
-4. `pip install opencv-python numpy`
+4. `uv sync`（このフォルダ専用の `.venv` に opencv-python と numpy が入る。全部更新.bat が自動でやる）。以降は `uv run python kate_merge_bot.py ...` で動かす。uv が無ければ従来どおり `pip install opencv-python numpy`
 5. 見る用：`scrcpy` でミラーリング（botの動作とは独立）
 
 ## 使い方
