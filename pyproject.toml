@@ -1,0 +1,13 @@
+[project]
+name = "kate-merge-bot"
+version = "0.1.0"
+description = "ケイトの冒険・矢印パズルの自動操作bot（PC側の環境）"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python",
+    "numpy",
+]
+# スマホ（Termux）側は termux_setup.sh の pkg install で入れる。uv は使わない
+
+[tool.uv]
+package = false
